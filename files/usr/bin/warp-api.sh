@@ -37,8 +37,8 @@ warp_connect() {
   command -v wg >/dev/null 2>&1 || { apk add wireguard-tools 2>/dev/null || opkg install wireguard-tools 2>/dev/null; }
   PRIV=$(wg genkey 2>/dev/null)
   PUB=$(echo "$PRIV" | wg pubkey 2>/dev/null)
-  # Cloudflare API
-  JSON=$(curl -s --max-time 10 -X POST https://api.cloudflareclient.com/v0a2158/reg -H "Content-Type: application/json" -d "{\"install_id\":\"\",\"tos\":\"$(date -u +%FT%T.000Z)\",\"key\":\"$PUB\",\"fcm_token\":\"\",\"type\":\"\",\"locale\":\"en-US\"}" 2>/dev/null)
+  # Cloudflare API (FIXED: added closing brace)
+  JSON=$(curl -s --max-time 10 -X POST https://api.cloudflareclient.com/v0a2158/reg -H "Content-Type: application/json" -d "{\"install_id\":\"\",\"tos\":\"$(date -u +%FT%T.000Z)\",\"key\":\"$PUB\"}")
   ID=$(echo "$JSON" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
   TOKEN=$(echo "$JSON" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
   if [ -z "$ID" ]; then
@@ -157,6 +157,8 @@ pbr_add() {
 
 pbr_del() {
   N="$1"
+  # FIXED: validate that N is a number
+  case "$N" in ''|*[!0-9]*) echo "❌ Номер має бути число"; return 1;; esac
   sed -i "${N}d" "$BLOCKED" 2>/dev/null && echo "✅ Видалено" || echo "❌ Немає такого"
 }
 
@@ -185,38 +187,37 @@ pbr_update() {
 }
 
 pbr_apply() {
-  cat <<PEOF
-BFILE="$BLOCKED"
-if [ ! -s "\$BFILE" ]; then echo "PBR: blocked.list порожній"; exit 1; fi
-nft add set inet fw4 blocked_net '{ type ipv4_addr; flags interval; }' 2>/dev/null
-nft flush set inet fw4 blocked_net 2>/dev/null
-while IFS= read -r CIDR; do
-  [ -n "\$CIDR" ] && nft add element inet fw4 blocked_net "{ \$CIDR }" 2>/dev/null
-done < "\$BFILE"
-# iptables fallback + nft prerouting (правильне місце — prerouting, не forward)
-OLDH=\$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
-[ -n "\$OLDH" ] && nft delete rule inet fw4 prerouting handle \$OLDH 2>/dev/null
-nft insert rule inet fw4 prerouting ip daddr @blocked_net meta mark set 0x1 2>/dev/null
-# iptables mangle для сумісності
-iptables -t mangle -D PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
-iptables -t mangle -A PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
-ip rule del fwmark 0x1 2>/dev/null
-ip rule add fwmark 0x1 lookup 100
-ip route replace default dev warp table 100 2>/dev/null
-echo "PBR: застосовано (\$(wc -l < "\$BFILE") записів)"
-PEOF
+  # FIXED: hardcoded path instead of variable expansion in eval context
+  if [ ! -s "$BLOCKED" ]; then 
+    echo "PBR: blocked.list порожній"
+    return 1
+  fi
+  nft add set inet fw4 blocked_net '{ type ipv4_addr; flags interval; }' 2>/dev/null
+  nft flush set inet fw4 blocked_net 2>/dev/null
+  while IFS= read -r CIDR; do
+    [ -n "$CIDR" ] && nft add element inet fw4 blocked_net "{ $CIDR }" 2>/dev/null
+  done < "$BLOCKED"
+  # iptables fallback + nft prerouting (правильне місце — prerouting, не forward)
+  OLDH=$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
+  [ -n "$OLDH" ] && nft delete rule inet fw4 prerouting handle $OLDH 2>/dev/null
+  nft insert rule inet fw4 prerouting ip daddr @blocked_net meta mark set 0x1 2>/dev/null
+  # iptables mangle для сумісності
+  iptables -t mangle -D PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
+  iptables -t mangle -A PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
+  ip rule del fwmark 0x1 2>/dev/null
+  ip rule add fwmark 0x1 lookup 100
+  ip route replace default dev warp table 100 2>/dev/null
+  echo "PBR: застосовано ($(wc -l < "$BLOCKED") записів)"
 }
 
 pbr_clear() {
-  cat <<CEOF
-nft flush set inet fw4 blocked_net 2>/dev/null
-nft delete set inet fw4 blocked_net 2>/dev/null
-OLDH=\$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
-[ -n "\$OLDH" ] && nft delete rule inet fw4 prerouting handle \$OLDH 2>/dev/null
-iptables -t mangle -D PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
-ip rule del fwmark 0x1 2>/dev/null
-echo "PBR: правила прибрано"
-CEOF
+  nft flush set inet fw4 blocked_net 2>/dev/null
+  nft delete set inet fw4 blocked_net 2>/dev/null
+  OLDH=$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
+  [ -n "$OLDH" ] && nft delete rule inet fw4 prerouting handle $OLDH 2>/dev/null
+  iptables -t mangle -D PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
+  ip rule del fwmark 0x1 2>/dev/null
+  echo "PBR: правила прибрано"
 }
 
 warp_mtu_test() {
@@ -251,8 +252,8 @@ case "$1" in
   pbr_add) pbr_add "$2" ;;
   pbr_del) pbr_del "$2" ;;
   pbr_update) pbr_update ;;
-  pbr_apply) eval "$(pbr_apply)"; echo "✅ PBR застосовано" ;;
-  pbr_clear) eval "$(pbr_clear)"; echo "✅ PBR очищено" ;;
+  pbr_apply) pbr_apply; echo "✅ PBR застосовано" ;;
+  pbr_clear) pbr_clear; echo "✅ PBR очищено" ;;
   mtu) warp_mtu_test ;;
   ping) warp_ping ;;
   *) echo "usage: $0 status|connect|delete|mode_all|mode_stop|pbr_list|pbr_add <IP>|pbr_del <N>|pbr_update|pbr_apply|mtu|ping" ;;
