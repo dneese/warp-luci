@@ -39,12 +39,10 @@ warp_status() {
     esac
   fi
   ip addr show warp 2>/dev/null | grep -q "inet" && echo "warp: up" || echo "warp: down"
-  # Показуємо результат MTU тесту якщо є
   if [ -f "$MTU_LOG" ]; then
     echo "--- MTU лог ---"
     cat "$MTU_LOG"
   fi
-  # Показуємо результат endpoint тесту якщо є
   if [ -f "$ENDPOINT_LOG" ]; then
     echo "--- Endpoint лог ---"
     cat "$ENDPOINT_LOG"
@@ -85,7 +83,8 @@ warp_connect() {
   uci set network.@wireguard_warp[-1].persistent_keepalive='25'
   uci set network.@wireguard_warp[-1].route_allowed_ips='0'
   uci commit network
-  if ! uci -q get firewall.warp >/dev/null 2>&1; then
+  # Firewall zone для warp (якщо не існує)
+  if ! uci show firewall 2>/dev/null | grep -q "name='warp'"; then
     uci add firewall zone >/dev/null
     Z=$(uci show firewall | grep -c '=zone')
     Z=$((Z-1))
@@ -126,6 +125,7 @@ warp_delete() {
   uci commit network; uci commit firewall
   rm -f "$WARP_REG" "$DIR/.pbr_active" "$MTU_LOG" "$ENDPOINT_LOG"
   /etc/init.d/network reload 2>/dev/null
+  /etc/init.d/firewall restart 2>/dev/null
   echo "🗑 WARP видалено"
 }
 
@@ -133,15 +133,18 @@ warp_mode_all() {
   if ! uci -q get network.warp >/dev/null 2>&1; then
     echo "❌ WARP не налаштовано. Спочатку: warp-api.sh connect"; return 1
   fi
+  # FIX: завжди додаємо forwarding якщо нема, і завжди перезапускаємо firewall
   uci set network.@wireguard_warp[0].route_allowed_ips='1'
-  if ! uci show firewall 2>/dev/null | grep -q "src='lan'.*dest='warp'"; then
+  uci commit network
+  if ! uci show firewall 2>/dev/null | grep -q "dest='warp'"; then
     uci add firewall forwarding >/dev/null
     uci set firewall.@forwarding[-1].src='lan'
     uci set firewall.@forwarding[-1].dest='warp'
     uci commit firewall
-    /etc/init.d/firewall restart 2>/dev/null
   fi
-  uci commit network
+  # Завжди перезапускаємо firewall і мережу щоб route_allowed_ips та forwarding набули чинності
+  /etc/init.d/firewall restart 2>/dev/null
+  sleep 1
   /etc/init.d/network reload 2>/dev/null
   sleep 3
   if [ -f "$DIR/.pbr_active" ]; then
@@ -292,6 +295,7 @@ pbr_apply() {
     echo "PBR: blocked.list та domains.list порожні"
     return 1
   fi
+  # FIX: тільки nft (OpenWrt 23+), прибрано iptables який конфліктує
   nft add set inet fw4 blocked_net '{ type ipv4_addr; flags interval; }' 2>/dev/null
   nft flush set inet fw4 blocked_net 2>/dev/null
   if [ -s "$BLOCKED" ]; then
@@ -300,14 +304,17 @@ pbr_apply() {
     done < "$BLOCKED"
   fi
   _pbr_resolve_domains
+  # Видаляємо стару PBR chain rule якщо є
   OLDH=$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
   [ -n "$OLDH" ] && nft delete rule inet fw4 prerouting handle "$OLDH" 2>/dev/null
-  nft insert rule inet fw4 prerouting ip daddr @blocked_net meta mark set 0x1 2>/dev/null
-  iptables -t mangle -D PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
-  iptables -t mangle -A PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
+  # FIX: використовуємо chain forward замість prerouting для маршрутизації між зонами
+  nft insert rule inet fw4 forward ip daddr @blocked_net accept 2>/dev/null
+  # Маршрут: позначені пакети → таблиця 100 → warp
   ip rule del fwmark 0x1 2>/dev/null
   ip rule add fwmark 0x1 lookup 100
   ip route replace default dev warp table 100 2>/dev/null
+  # nft маркування у prerouting
+  nft insert rule inet fw4 prerouting ip daddr @blocked_net meta mark set 0x1 2>/dev/null
   touch "$DIR/.pbr_active"
   echo "PBR: застосовано ($(wc -l < "$BLOCKED" 2>/dev/null || echo 0) IP-записів)"
 }
@@ -315,15 +322,20 @@ pbr_apply() {
 pbr_clear() {
   nft flush set inet fw4 blocked_net 2>/dev/null
   nft delete set inet fw4 blocked_net 2>/dev/null
-  OLDH=$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
-  [ -n "$OLDH" ] && nft delete rule inet fw4 prerouting handle "$OLDH" 2>/dev/null
-  iptables -t mangle -D PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
+  # Видаляємо правила з prerouting та forward
+  for CHAIN in prerouting forward; do
+    while true; do
+      H=$(nft -a list chain inet fw4 $CHAIN 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
+      [ -z "$H" ] && break
+      nft delete rule inet fw4 $CHAIN handle "$H" 2>/dev/null
+    done
+  done
   ip rule del fwmark 0x1 2>/dev/null
+  ip route del default table 100 2>/dev/null
   rm -f "$DIR/.pbr_active"
   echo "PBR: правила прибрано"
 }
 
-# Внутрішній: власне тест MTU, пишемо в лог-файл (викликається у фоні)
 _mtu_run() {
   mkdir -p "$DIR"
   echo "⏳ Запущено: $(date)" > "$MTU_LOG"
@@ -355,14 +367,12 @@ warp_mtu_test() {
     echo "❌ WARP не налаштовано. Спочатку підключіть: warp-api.sh connect"
     return 1
   fi
-  # Перевіряємо чи тест вже запущений
   if [ -f "$MTU_LOG" ] && grep -q '⏳ Запущено' "$MTU_LOG" && ! grep -q '✅ Готово' "$MTU_LOG"; then
     echo "⏳ Тест MTU вже виконується, зачекайте ~30с"
     echo "Поточний лог:"
     cat "$MTU_LOG"
     return 0
   fi
-  # Запускаємо у фоні — LuCI не чекає
   ( _mtu_run ) &
   echo "⏳ MTU тест запущено у фоні (~30с)"
   echo "Оновіть статус через 30 секунд — результат з'явиться в блоці Статус."
@@ -386,7 +396,6 @@ warp_ping() {
   done
 }
 
-# Внутрішній: пінгує кандидатів, обирає найшвидший IP, прописує в UCI (фон)
 _endpoint_run() {
   mkdir -p "$DIR"
   echo "⏳ Запущено: $(date)" > "$ENDPOINT_LOG"
@@ -401,7 +410,6 @@ _endpoint_run() {
       continue
     fi
     echo "📡 $IP: ${AVG} ms" >> "$ENDPOINT_LOG"
-    # Порівняння float через awk (busybox sh не підтримує)
     IS_BETTER=$(awk -v a="$AVG" -v b="$BEST_AVG" 'BEGIN{print (a<b)?1:0}')
     if [ "$IS_BETTER" = "1" ]; then
       BEST_AVG="$AVG"
@@ -438,7 +446,6 @@ warp_best_endpoint() {
     echo "❌ WARP не налаштовано. Спочатку: warp-api.sh connect"
     return 1
   fi
-  # Перевіряємо чи тест вже запущений
   if [ -f "$ENDPOINT_LOG" ] && grep -q '⏳ Запущено' "$ENDPOINT_LOG" && ! grep -q '✅ Готово' "$ENDPOINT_LOG"; then
     echo "⏳ Вибір endpoint вже виконується, зачекайте ~20с"
     cat "$ENDPOINT_LOG"
