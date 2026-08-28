@@ -1,19 +1,277 @@
-warp_ping() {
-   for EP in engage.cloudflareclient.com 162.159.192.1 162.159.193.1 188.114.96.1 188.114.97.1; do
-     # Попробуем разные форматы вывода ping
-     RESULT=$(ping -c 3 -W 2 "$EP" 2>/dev/null)
-     
-     # Ищем avg в разных форматах
-     AVG=$(echo "$RESULT" | grep -oE 'min/avg/max|rtt min/avg/max' | head -1)
-     if [ -n "$AVG" ]; then
-       # Формат: min/avg/max/stddev = X.XXX/Y.YYY/Z.ZZZ/W.WWW ms
-       AVG=$(echo "$RESULT" | grep -oE '[0-9.]+/[0-9.]+/[0-9.]+' | cut -d/ -f2)
-     else
-       # Альтернативный формат с time=X.Xms
-       AVG=$(echo "$RESULT" | grep -oE 'time=[0-9.]+ ms' | cut -d= -f2 | cut -d' ' -f1)
-     fi
-     
-     [ -z "$AVG" ] && AVG="—"
-     echo "$EP: $AVG ms"
-   done
+#!/bin/sh
+# warp-api.sh — бекенд для LuCI Cloudflare WARP
+# Виклик: warp-api.sh status|connect|delete|mode_all|mode_stop|mode_pbr|pbr_list|pbr_add <IP>|pbr_del <N>|pbr_update|pbr_apply|pbr_clear|mtu|ping
+
+DIR="/etc/warp"
+WARP_REG="$DIR/warp.reg"
+BLOCKED="$DIR/blocked.list"
+
+warp_status() {
+  if ! uci -q get network.warp >/dev/null 2>&1; then
+    echo "📭 не налаштовано"
+    return
+  fi
+  HS=$(wg show warp latest-handshakes 2>/dev/null | awk '{print $2}')
+  if [ -z "$HS" ] || [ "$HS" = "0" ]; then
+    echo "🔴 Немає handshake"
+  else
+    echo "🟢 Тунель активний (hs=$HS)"
+  fi
+  if nft list set inet fw4 blocked_net >/dev/null 2>&1; then
+    CNT=$(nft list set inet fw4 blocked_net 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l | tr -d ' ')
+    echo "режим: тільки заблоковані через WARP (PBR, ${CNT:-0} записів)"
+  else
+    ALLOWED=$(uci -q get network.@wireguard_warp[0].route_allowed_ips 2>/dev/null)
+    case "$ALLOWED" in
+      "1"|"0.0.0.0/0"*) echo "режим: весь трафік через WARP" ;;
+      "0") echo "режим: тунель є, трафік не перехоплюється" ;;
+      *) echo "режим: $ALLOWED" ;;
+    esac
+  fi
+  ip addr show warp 2>/dev/null | grep -q "inet" && echo "warp: up" || echo "warp: down"
 }
+
+warp_connect() {
+  command -v wg >/dev/null 2>&1 || { apk add wireguard-tools 2>/dev/null || opkg install wireguard-tools 2>/dev/null; }
+  PRIV=$(wg genkey 2>/dev/null)
+  PUB=$(echo "$PRIV" | wg pubkey 2>/dev/null)
+  JSON=$(curl -s --max-time 10 -X POST https://api.cloudflareclient.com/v0a2158/reg \
+    -H "Content-Type: application/json" \
+    -d "{\"install_id\":\"\",\"tos\":\"$(date -u +%FT%T.000Z)\",\"key\":\"$PUB\"}")
+  ID=$(echo "$JSON" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+  TOKEN=$(echo "$JSON" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+  if [ -z "$ID" ]; then
+    echo "❌ Реєстрація не вдалася (Cloudflare API)"
+    echo "$JSON" | head -c 300
+    return 1
+  fi
+  mkdir -p "$DIR"
+  umask 077; printf '%s\n%s\n%s\n' "$PRIV" "$ID" "$TOKEN" > "$WARP_REG"
+  uci -q delete network.warp 2>/dev/null
+  while uci -q delete network.@wireguard_warp[0] >/dev/null 2>&1; do :; done
+  uci set network.warp=interface
+  uci set network.warp.proto='wireguard'
+  uci set network.warp.private_key="$PRIV"
+  uci add_list network.warp.addresses="172.16.0.2/32"
+  uci set network.warp.mtu='1280'
+  uci add network wireguard_warp >/dev/null
+  PEER=$(echo "$JSON" | grep -o '"public_key":"[^"]*"' | cut -d'"' -f4)
+  [ -z "$PEER" ] && PEER="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+  uci set network.@wireguard_warp[-1].public_key="$PEER"
+  uci set network.@wireguard_warp[-1].endpoint_host='engage.cloudflareclient.com'
+  uci set network.@wireguard_warp[-1].endpoint_port='2408'
+  uci add_list network.@wireguard_warp[-1].allowed_ips='0.0.0.0/0'
+  uci add_list network.@wireguard_warp[-1].allowed_ips='::/0'
+  uci set network.@wireguard_warp[-1].persistent_keepalive='25'
+  uci set network.@wireguard_warp[-1].route_allowed_ips='0'
+  uci commit network
+  if ! uci -q get firewall.warp >/dev/null 2>&1; then
+    uci add firewall zone >/dev/null
+    Z=$(uci show firewall | grep -c '=zone')
+    Z=$((Z-1))
+    uci set firewall.@zone[$Z].name='warp'
+    uci set firewall.@zone[$Z].input='REJECT'
+    uci set firewall.@zone[$Z].output='ACCEPT'
+    uci set firewall.@zone[$Z].forward='REJECT'
+    uci add_list firewall.@zone[$Z].network='warp'
+    uci set firewall.@zone[$Z].masq='1'
+    uci commit firewall
+  fi
+  ifup warp 2>/dev/null || /etc/init.d/network reload 2>/dev/null
+  sleep 6
+  HS=$(wg show warp latest-handshakes 2>/dev/null | awk '{print $2}')
+  if [ -n "$HS" ] && [ "$HS" != "0" ]; then
+    echo "✅ WARP створено, handshake OK"
+  else
+    echo "⚠️ Тунель створено, але handshake поки 0 — спробуйте warp-api.sh mtu"
+  fi
+}
+
+warp_delete() {
+  ifdown warp 2>/dev/null
+  while uci -q delete network.@wireguard_warp[0] >/dev/null 2>&1; do :; done
+  uci -q delete network.warp 2>/dev/null
+  N=$(uci show firewall 2>/dev/null | grep -c '=forwarding')
+  i=$((N-1)); while [ "$i" -ge 0 ]; do
+    FS=$(uci -q get firewall.@forwarding[$i].src 2>/dev/null)
+    FD=$(uci -q get firewall.@forwarding[$i].dest 2>/dev/null)
+    [ "$FS" = "lan" ] && [ "$FD" = "warp" ] && uci -q delete firewall.@forwarding[$i] 2>/dev/null
+    i=$((i-1))
+  done
+  Z=$(uci show firewall 2>/dev/null | grep -c '=zone')
+  i=$((Z-1)); while [ "$i" -ge 0 ]; do
+    [ "$(uci -q get firewall.@zone[$i].name 2>/dev/null)" = "warp" ] && uci -q delete firewall.@zone[$i] 2>/dev/null
+    i=$((i-1))
+  done
+  uci commit network; uci commit firewall
+  rm -f "$WARP_REG" "$DIR/.pbr_active"
+  /etc/init.d/network reload 2>/dev/null
+  echo "🗑 WARP видалено"
+}
+
+warp_mode_all() {
+  uci set network.@wireguard_warp[0].route_allowed_ips='1'
+  if ! uci show firewall 2>/dev/null | grep -q "src='lan'.*dest='warp'"; then
+    uci add firewall forwarding >/dev/null
+    uci set firewall.@forwarding[-1].src='lan'
+    uci set firewall.@forwarding[-1].dest='warp'
+    uci commit firewall
+    /etc/init.d/firewall restart 2>/dev/null
+  fi
+  uci commit network
+  /etc/init.d/network reload 2>/dev/null
+  sleep 3
+  if [ -f "$DIR/.pbr_active" ]; then
+    pbr_clear
+    rm -f "$DIR/.pbr_active"
+  fi
+  echo "🟢 Весь трафік через WARP"
+}
+
+warp_mode_stop() {
+  uci set network.@wireguard_warp[0].route_allowed_ips='0'
+  uci commit network
+  /etc/init.d/network reload 2>/dev/null
+  if [ -f "$DIR/.pbr_active" ]; then
+    pbr_clear
+    rm -f "$DIR/.pbr_active"
+  fi
+  echo "⏸ Трафік не перехоплюється (тунель є)"
+}
+
+warp_mode_pbr() {
+  uci set network.@wireguard_warp[0].route_allowed_ips='0'
+  uci commit network
+  /etc/init.d/network reload 2>/dev/null
+  sleep 2
+  pbr_apply
+  touch "$DIR/.pbr_active"
+  echo "📋 Режим PBR активовано"
+}
+
+pbr_list() {
+  if [ ! -f "$BLOCKED" ] || [ ! -s "$BLOCKED" ]; then
+    echo "📋 Список порожній"
+  else
+    cat "$BLOCKED" | head -n 100
+  fi
+}
+
+pbr_add() {
+  IP="$1"
+  case "$IP" in ''|*[!0-9./]*) echo "❌ Невірний формат"; return 1;; esac
+  echo "$IP" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(/([0-9]|[12][0-9]|3[012]))?$' || { echo "❌ Невірний CIDR"; return 1; }
+  echo "$IP" >> "$BLOCKED"
+  echo "✅ Додано: $IP"
+}
+
+pbr_del() {
+  N="$1"
+  case "$N" in ''|*[!0-9]*) echo "❌ Номер має бути число"; return 1;; esac
+  sed -i "${N}d" "$BLOCKED" 2>/dev/null && echo "✅ Видалено" || echo "❌ Немає такого"
+}
+
+pbr_update() {
+  URL="https://raw.githubusercontent.com/dneese/warp-luci/main/blocked.list"
+  mkdir -p "$DIR"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 15 "$URL" -o "$BLOCKED.tmp" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$BLOCKED.tmp" "$URL" 2>/dev/null
+  elif command -v uclient-fetch >/dev/null 2>&1; then
+    uclient-fetch -qO "$BLOCKED.tmp" "$URL" 2>/dev/null
+  else
+    echo "❌ нема curl/wget/uclient-fetch"
+    return 1
+  fi
+  if [ -s "$BLOCKED.tmp" ] && grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.' "$BLOCKED.tmp"; then
+    mv "$BLOCKED.tmp" "$BLOCKED"
+    CNT=$(wc -l < "$BLOCKED" | tr -d ' ')
+    echo "✅ Список оновлено: $CNT записів"
+  else
+    rm -f "$BLOCKED.tmp"
+    echo "❌ Не вдалося оновити список"
+    return 1
+  fi
+}
+
+pbr_apply() {
+  if [ ! -s "$BLOCKED" ]; then
+    echo "PBR: blocked.list порожній"
+    return 1
+  fi
+  nft add set inet fw4 blocked_net '{ type ipv4_addr; flags interval; }' 2>/dev/null
+  nft flush set inet fw4 blocked_net 2>/dev/null
+  while IFS= read -r CIDR; do
+    [ -n "$CIDR" ] && nft add element inet fw4 blocked_net "{ $CIDR }" 2>/dev/null
+  done < "$BLOCKED"
+  OLDH=$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
+  [ -n "$OLDH" ] && nft delete rule inet fw4 prerouting handle "$OLDH" 2>/dev/null
+  nft insert rule inet fw4 prerouting ip daddr @blocked_net meta mark set 0x1 2>/dev/null
+  iptables -t mangle -D PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
+  iptables -t mangle -A PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
+  ip rule del fwmark 0x1 2>/dev/null
+  ip rule add fwmark 0x1 lookup 100
+  ip route replace default dev warp table 100 2>/dev/null
+  echo "PBR: застосовано ($(wc -l < "$BLOCKED") записів)"
+}
+
+pbr_clear() {
+  nft flush set inet fw4 blocked_net 2>/dev/null
+  nft delete set inet fw4 blocked_net 2>/dev/null
+  OLDH=$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
+  [ -n "$OLDH" ] && nft delete rule inet fw4 prerouting handle "$OLDH" 2>/dev/null
+  iptables -t mangle -D PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
+  ip rule del fwmark 0x1 2>/dev/null
+  echo "PBR: правила прибрано"
+}
+
+warp_mtu_test() {
+  echo "⏳ Тест MTU 1420/1400/1380/1280..."
+  BEST=""
+  for MTU in 1420 1400 1380 1280; do
+    uci set network.warp.mtu="$MTU"; uci commit network
+    /etc/init.d/network reload 2>/dev/null; sleep 6
+    HS=$(wg show warp latest-handshakes 2>/dev/null | awk '{print $2}')
+    if [ -n "$HS" ] && [ "$HS" != "0" ]; then
+      echo "✅ MTU $MTU: handshake OK"
+      [ -z "$BEST" ] && BEST="$MTU"
+    else
+      echo "❌ MTU $MTU: no handshake"
+    fi
+  done
+  FINAL="${BEST:-1280}"
+  uci set network.warp.mtu="$FINAL"; uci commit network
+  /etc/init.d/network reload 2>/dev/null
+  echo "📏 Фінальний MTU: $FINAL"
+}
+
+warp_ping() {
+  for EP in engage.cloudflareclient.com 162.159.192.1 162.159.193.1 188.114.96.1 188.114.97.1; do
+    RESULT=$(ping -c 3 -W 2 "$EP" 2>/dev/null)
+    # BusyBox/OpenWrt format: min/avg/max = X/Y/Z ms
+    AVG=$(echo "$RESULT" | grep -oE '[0-9]+/[0-9]+/[0-9]+' | cut -d/ -f2)
+    # Linux fallback: rtt min/avg/max/mdev = X.X/Y.Y/Z.Z/W.W ms
+    [ -z "$AVG" ] && AVG=$(echo "$RESULT" | grep -oE '[0-9]+\.[0-9]+/[0-9]+\.[0-9]+/[0-9]+\.[0-9]+' | cut -d/ -f2)
+    [ -z "$AVG" ] && AVG="—"
+    echo "$EP: ${AVG} ms"
+  done
+}
+
+case "$1" in
+  status)     warp_status ;;
+  connect)    warp_connect ;;
+  delete)     warp_delete ;;
+  mode_all)   warp_mode_all ;;
+  mode_stop)  warp_mode_stop ;;
+  mode_pbr)   warp_mode_pbr ;;
+  pbr_list)   pbr_list ;;
+  pbr_add)    pbr_add "$2" ;;
+  pbr_del)    pbr_del "$2" ;;
+  pbr_update) pbr_update ;;
+  pbr_apply)  pbr_apply ;;
+  pbr_clear)  pbr_clear ;;
+  mtu)        warp_mtu_test ;;
+  ping)       warp_ping ;;
+  *) echo "usage: $0 status|connect|delete|mode_all|mode_stop|mode_pbr|pbr_list|pbr_add <IP>|pbr_del <N>|pbr_update|pbr_apply|pbr_clear|mtu|ping" ;;
+esac

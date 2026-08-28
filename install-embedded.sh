@@ -1,27 +1,27 @@
 #!/bin/sh
-# WARP LuCI — встроенная однострочная установка прямо на роутере
+# WARP LuCI — вбудована однорядкова установка прямо на роутері
 
 set -e
 
 echo "📦 WARP LuCI — установка..."
 
-# Создаем директории
+# Створюємо директорії
 mkdir -p /usr/bin /etc/warp /www/luci-static/resources/view/warp /usr/share/luci/menu.d /usr/share/rpcd/acl.d
 
-echo "⬇️  Скачиваем warp-api.sh..."
+echo "⬇️  Завантажуємо warp-api.sh..."
 curl -fsSL https://raw.githubusercontent.com/dneese/warp-luci/main/files/usr/bin/warp-api.sh -o /usr/bin/warp-api.sh 2>/dev/null || \
   wget -q -O /usr/bin/warp-api.sh https://raw.githubusercontent.com/dneese/warp-luci/main/files/usr/bin/warp-api.sh 2>/dev/null || \
-  uclient-fetch -q -O /usr/bin/warp-api.sh https://raw.githubusercontent.com/dneese/warp-luci/main/files/usr/bin/warp-api.sh 2>/dev/null
+  uclient-fetch -q -O /usr/bin/warp-api.sh https://raw.githubusercontent.com/dneese/warp-luci/main/files/usr/bin/warp-api.sh
 chmod +x /usr/bin/warp-api.sh
 
-echo "⬇️  Скачиваем overview.js..."
+echo "⬇️  Завантажуємо overview.js..."
 curl -fsSL https://raw.githubusercontent.com/dneese/warp-luci/main/files/www/luci-static/resources/view/warp/overview.js -o /www/luci-static/resources/view/warp/overview.js 2>/dev/null || \
   wget -q -O /www/luci-static/resources/view/warp/overview.js https://raw.githubusercontent.com/dneese/warp-luci/main/files/www/luci-static/resources/view/warp/overview.js 2>/dev/null || \
-  uclient-fetch -q -O /www/luci-static/resources/view/warp/overview.js https://raw.githubusercontent.com/dneese/warp-luci/main/files/www/luci-static/resources/view/warp/overview.js 2>/dev/null
+  uclient-fetch -q -O /www/luci-static/resources/view/warp/overview.js https://raw.githubusercontent.com/dneese/warp-luci/main/files/www/luci-static/resources/view/warp/overview.js
 chmod 644 /www/luci-static/resources/view/warp/overview.js 2>/dev/null
 chmod 755 /www/luci-static/resources/view/warp 2>/dev/null
 
-echo "⚙️  Настраиваем LuCI меню..."
+echo "⚙️  Налаштовуємо LuCI меню..."
 cat > /usr/share/luci/menu.d/luci-app-warp.json <<'EOF'
 {
   "admin/services/warp": {
@@ -33,7 +33,7 @@ cat > /usr/share/luci/menu.d/luci-app-warp.json <<'EOF'
 }
 EOF
 
-echo "⚙️  Настраиваем ACL..."
+echo "⚙️  Налаштовуємо ACL..."
 cat > /usr/share/rpcd/acl.d/luci-app-warp.json <<'EOF'
 {
   "luci-app-warp": {
@@ -46,29 +46,30 @@ EOF
 
 chmod 644 /usr/share/luci/menu.d/luci-app-warp.json /usr/share/rpcd/acl.d/luci-app-warp.json 2>/dev/null
 
-echo "⚙️  Инициализирую конфиг..."
-uci set warp.config=config 2>/dev/null || uci set warp.config='config' 2>/dev/null
-uci commit warp 2>/dev/null
+echo "⚙️  Ініціалізуємо конфіг..."
+uci set warp.config=config 2>/dev/null || true
+uci commit warp 2>/dev/null || true
 
-echo "🔄 Перезагружаю сервисы..."
-/etc/init.d/rpcd restart 2>/dev/null
-/etc/init.d/uhttpd restart 2>/dev/null
-rm -f /tmp/luci-* 2>/dev/null
+echo "🔄 Перезавантажуємо сервіси..."
+/etc/init.d/rpcd restart 2>/dev/null || true
+/etc/init.d/uhttpd restart 2>/dev/null || true
+rm -f /tmp/luci-* 2>/dev/null || true
 
 echo ""
 echo "✅ ════════════════════════════════════════════════"
-echo "✅ WARP LuCI успешно установлен!"
+echo "✅ WARP LuCI успішно встановлено!"
 echo "✅ ════════════════════════════════════════════════"
 echo ""
-echo "📍 Откройте в браузере:"
+echo "📍 Відкрийте в браузері:"
 echo "   http://192.168.1.1/cgi-bin/luci/admin/services/warp"
 echo ""
-echo "📍 Или в LuCI:"
-echo "   Services → WARP"
+echo "📍 Або в LuCI: Services → WARP"
 echo ""
-echo "📍 CLI команды:"
+echo "📍 CLI команди:"
 echo "   warp-api.sh status"
 echo "   warp-api.sh connect"
 echo ""
 
+# set +e щоб status не зламав установку на свіжому роутері
+set +e
 warp-api.sh status 2>&1 | head -n 3
