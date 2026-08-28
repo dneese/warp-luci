@@ -110,6 +110,9 @@ warp_delete() {
 }
 
 warp_mode_all() {
+  if ! uci -q get network.warp >/dev/null 2>&1; then
+    echo "❌ WARP не налаштовано. Спочатку: warp-api.sh connect"; return 1
+  fi
   uci set network.@wireguard_warp[0].route_allowed_ips='1'
   if ! uci show firewall 2>/dev/null | grep -q "src='lan'.*dest='warp'"; then
     uci add firewall forwarding >/dev/null
@@ -129,6 +132,9 @@ warp_mode_all() {
 }
 
 warp_mode_stop() {
+  if ! uci -q get network.warp >/dev/null 2>&1; then
+    echo "❌ WARP не налаштовано. Спочатку: warp-api.sh connect"; return 1
+  fi
   uci set network.@wireguard_warp[0].route_allowed_ips='0'
   uci commit network
   /etc/init.d/network reload 2>/dev/null
@@ -140,6 +146,9 @@ warp_mode_stop() {
 }
 
 warp_mode_pbr() {
+  if ! uci -q get network.warp >/dev/null 2>&1; then
+    echo "❌ WARP не налаштовано. Спочатку: warp-api.sh connect"; return 1
+  fi
   uci set network.@wireguard_warp[0].route_allowed_ips='0'
   uci commit network
   /etc/init.d/network reload 2>/dev/null
@@ -227,11 +236,22 @@ pbr_clear() {
 }
 
 warp_mtu_test() {
+  # Проверяем что warp уже создан
+  if ! uci -q get network.warp >/dev/null 2>&1; then
+    echo "❌ WARP не налаштовано. Спочатку підключіть: warp-api.sh connect"
+    return 1
+  fi
   echo "⏳ Тест MTU 1420/1400/1380/1280..."
   BEST=""
   for MTU in 1420 1400 1380 1280; do
-    uci set network.warp.mtu="$MTU"; uci commit network
-    /etc/init.d/network reload 2>/dev/null; sleep 6
+    # Встановлюємо MTU через uci та одразу через ip link (подвійна гарантія)
+    uci set network.warp.mtu="$MTU"
+    uci commit network
+    # Застосовуємо MTU напряму на інтерфейс без повного reload (швидше)
+    ip link set mtu "$MTU" dev warp 2>/dev/null || true
+    # Якщо інтерфейс впав — піднімаємо
+    ip link show warp 2>/dev/null | grep -q 'DOWN' && ifup warp 2>/dev/null || true
+    sleep 6
     HS=$(wg show warp latest-handshakes 2>/dev/null | awk '{print $2}')
     if [ -n "$HS" ] && [ "$HS" != "0" ]; then
       echo "✅ MTU $MTU: handshake OK"
@@ -241,8 +261,9 @@ warp_mtu_test() {
     fi
   done
   FINAL="${BEST:-1280}"
-  uci set network.warp.mtu="$FINAL"; uci commit network
-  /etc/init.d/network reload 2>/dev/null
+  uci set network.warp.mtu="$FINAL"
+  uci commit network
+  ip link set mtu "$FINAL" dev warp 2>/dev/null || true
   echo "📏 Фінальний MTU: $FINAL"
 }
 
