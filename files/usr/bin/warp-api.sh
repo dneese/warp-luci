@@ -2,19 +2,25 @@
 # warp-api.sh — бекенд для LuCI Cloudflare WARP
 # Виклик: warp-api.sh status|connect|delete|mode_all|mode_stop|mode_pbr|
 #   pbr_list|pbr_add <IP>|pbr_del <N>|pbr_add_domain <domain>|pbr_del_domain <domain>|
-#   pbr_update|pbr_apply|pbr_clear|mtu|mtu_result|ping
+#   pbr_update|pbr_apply|pbr_clear|mtu|mtu_result|ping|best_endpoint|endpoint_result
 
 DIR="/etc/warp"
 WARP_REG="$DIR/warp.reg"
 BLOCKED="$DIR/blocked.list"
 DOMAINS="$DIR/domains.list"
 MTU_LOG="$DIR/mtu.log"
+ENDPOINT_LOG="$DIR/endpoint.log"
+
+# Список кандидатів Cloudflare WARP endpoint IP
+ENDPOINT_CANDIDATES="162.159.192.1 162.159.193.1 162.159.195.1 188.114.96.1 188.114.97.1 188.114.98.1 188.114.99.1"
 
 warp_status() {
   if ! uci -q get network.warp >/dev/null 2>&1; then
     echo "📭 не налаштовано"
     return
   fi
+  EP=$(uci -q get network.@wireguard_warp[0].endpoint_host 2>/dev/null)
+  [ -n "$EP" ] && echo "endpoint: $EP"
   HS=$(wg show warp latest-handshakes 2>/dev/null | awk '{print $2}')
   if [ -z "$HS" ] || [ "$HS" = "0" ]; then
     echo "🔴 Немає handshake"
@@ -37,6 +43,11 @@ warp_status() {
   if [ -f "$MTU_LOG" ]; then
     echo "--- MTU лог ---"
     cat "$MTU_LOG"
+  fi
+  # Показуємо результат endpoint тесту якщо є
+  if [ -f "$ENDPOINT_LOG" ]; then
+    echo "--- Endpoint лог ---"
+    cat "$ENDPOINT_LOG"
   fi
 }
 
@@ -113,7 +124,7 @@ warp_delete() {
     i=$((i-1))
   done
   uci commit network; uci commit firewall
-  rm -f "$WARP_REG" "$DIR/.pbr_active" "$MTU_LOG"
+  rm -f "$WARP_REG" "$DIR/.pbr_active" "$MTU_LOG" "$ENDPOINT_LOG"
   /etc/init.d/network reload 2>/dev/null
   echo "🗑 WARP видалено"
 }
@@ -366,13 +377,84 @@ warp_mtu_result() {
 }
 
 warp_ping() {
-  for EP in engage.cloudflareclient.com 162.159.192.1 162.159.193.1 188.114.96.1 188.114.97.1; do
+  for EP in engage.cloudflareclient.com 162.159.192.1 162.159.193.1 162.159.195.1 188.114.96.1 188.114.97.1 188.114.98.1 188.114.99.1; do
     RESULT=$(ping -c 3 -W 2 "$EP" 2>/dev/null)
     AVG=$(echo "$RESULT" | grep -oE '[0-9]+/[0-9]+/[0-9]+' | cut -d/ -f2)
     [ -z "$AVG" ] && AVG=$(echo "$RESULT" | grep -oE '[0-9]+\.[0-9]+/[0-9]+\.[0-9]+/[0-9]+\.[0-9]+' | cut -d/ -f2)
     [ -z "$AVG" ] && AVG="—"
     echo "$EP: ${AVG} ms"
   done
+}
+
+# Внутрішній: пінгує кандидатів, обирає найшвидший IP, прописує в UCI (фон)
+_endpoint_run() {
+  mkdir -p "$DIR"
+  echo "⏳ Запущено: $(date)" > "$ENDPOINT_LOG"
+  BEST_IP=""
+  BEST_AVG=99999
+  for IP in $ENDPOINT_CANDIDATES; do
+    RESULT=$(ping -c 3 -W 2 "$IP" 2>/dev/null)
+    AVG=$(echo "$RESULT" | grep -oE '[0-9]+\.[0-9]+/[0-9]+\.[0-9]+/[0-9]+\.[0-9]+' | cut -d/ -f2)
+    [ -z "$AVG" ] && AVG=$(echo "$RESULT" | grep -oE '[0-9]+/[0-9]+/[0-9]+' | cut -d/ -f2)
+    if [ -z "$AVG" ]; then
+      echo "❌ $IP: немає відгуку" >> "$ENDPOINT_LOG"
+      continue
+    fi
+    echo "📡 $IP: ${AVG} ms" >> "$ENDPOINT_LOG"
+    # Порівняння float через awk (busybox sh не підтримує)
+    IS_BETTER=$(awk -v a="$AVG" -v b="$BEST_AVG" 'BEGIN{print (a<b)?1:0}')
+    if [ "$IS_BETTER" = "1" ]; then
+      BEST_AVG="$AVG"
+      BEST_IP="$IP"
+    fi
+  done
+  if [ -z "$BEST_IP" ]; then
+    echo "❌ Жоден endpoint не відповів — залишаю поточний" >> "$ENDPOINT_LOG"
+    echo "✅ Готово: $(date)" >> "$ENDPOINT_LOG"
+    return 1
+  fi
+  PREV_EP=$(uci -q get network.@wireguard_warp[0].endpoint_host 2>/dev/null)
+  uci set network.@wireguard_warp[0].endpoint_host="$BEST_IP"
+  uci commit network
+  ifdown warp 2>/dev/null
+  sleep 1
+  ifup warp 2>/dev/null
+  sleep 5
+  HS=$(wg show warp latest-handshakes 2>/dev/null | awk '{print $2}')
+  echo "🏆 Обрано: $BEST_IP (${BEST_AVG} ms)" >> "$ENDPOINT_LOG"
+  if [ -n "$HS" ] && [ "$HS" != "0" ]; then
+    echo "✅ Handshake OK з новим endpoint" >> "$ENDPOINT_LOG"
+  else
+    echo "⚠️ Handshake відсутній — повертаю попередній endpoint: ${PREV_EP:-engage.cloudflareclient.com}" >> "$ENDPOINT_LOG"
+    uci set network.@wireguard_warp[0].endpoint_host="${PREV_EP:-engage.cloudflareclient.com}"
+    uci commit network
+    ifdown warp 2>/dev/null; sleep 1; ifup warp 2>/dev/null
+  fi
+  echo "✅ Готово: $(date)" >> "$ENDPOINT_LOG"
+}
+
+warp_best_endpoint() {
+  if ! uci -q get network.warp >/dev/null 2>&1; then
+    echo "❌ WARP не налаштовано. Спочатку: warp-api.sh connect"
+    return 1
+  fi
+  # Перевіряємо чи тест вже запущений
+  if [ -f "$ENDPOINT_LOG" ] && grep -q '⏳ Запущено' "$ENDPOINT_LOG" && ! grep -q '✅ Готово' "$ENDPOINT_LOG"; then
+    echo "⏳ Вибір endpoint вже виконується, зачекайте ~20с"
+    cat "$ENDPOINT_LOG"
+    return 0
+  fi
+  ( _endpoint_run ) &
+  echo "⏳ Пошук найшвидшого endpoint запущено у фоні (~20с)"
+  echo "Оновіть статус через 25 секунд — результат з'явиться у блоці Статус."
+}
+
+warp_endpoint_result() {
+  if [ ! -f "$ENDPOINT_LOG" ]; then
+    echo "(лог вибору endpoint відсутній — запустіть: warp-api.sh best_endpoint)"
+    return
+  fi
+  cat "$ENDPOINT_LOG"
 }
 
 case "$1" in
@@ -393,5 +475,7 @@ case "$1" in
   mtu)             warp_mtu_test ;;
   mtu_result)      warp_mtu_result ;;
   ping)            warp_ping ;;
-  *) echo "usage: $0 status|connect|delete|mode_all|mode_stop|mode_pbr|pbr_list|pbr_add <IP>|pbr_del <N>|pbr_add_domain <domain>|pbr_del_domain <domain>|pbr_update|pbr_apply|pbr_clear|mtu|mtu_result|ping" ;;
+  best_endpoint)   warp_best_endpoint ;;
+  endpoint_result) warp_endpoint_result ;;
+  *) echo "usage: $0 status|connect|delete|mode_all|mode_stop|mode_pbr|pbr_list|pbr_add <IP>|pbr_del <N>|pbr_add_domain <domain>|pbr_del_domain <domain>|pbr_update|pbr_apply|pbr_clear|mtu|mtu_result|ping|best_endpoint|endpoint_result" ;;
 esac
