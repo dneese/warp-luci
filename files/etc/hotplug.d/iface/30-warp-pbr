@@ -5,7 +5,7 @@
 [ "$INTERFACE" = "warp" ] || exit 0
 [ "$ACTION" = "ifup" ] || exit 0
 [ -f /etc/warp/.pbr_active ] || exit 0
-[ -s /etc/warp/blocked.list ] || exit 0
+[ -s /etc/warp/blocked.list ] || [ -s /etc/warp/domains.list ] || exit 0
 
 logger -t warp-pbr "warp ifup detected, restoring PBR routes"
 

@@ -1,10 +1,13 @@
 #!/bin/sh
 # warp-api.sh — бекенд для LuCI Cloudflare WARP
-# Виклик: warp-api.sh status|connect|delete|mode_all|mode_stop|mode_pbr|pbr_list|pbr_add <IP>|pbr_del <N>|pbr_update|pbr_apply|pbr_clear|mtu|ping
+# Виклик: warp-api.sh status|connect|delete|mode_all|mode_stop|mode_pbr|
+#   pbr_list|pbr_add <IP>|pbr_del <N>|pbr_add_domain <domain>|pbr_del_domain <domain>|
+#   pbr_update|pbr_apply|pbr_clear|mtu|ping
 
 DIR="/etc/warp"
 WARP_REG="$DIR/warp.reg"
 BLOCKED="$DIR/blocked.list"
+DOMAINS="$DIR/domains.list"
 
 warp_status() {
   if ! uci -q get network.warp >/dev/null 2>&1; then
@@ -159,10 +162,18 @@ warp_mode_pbr() {
 }
 
 pbr_list() {
+  echo "=== IP-діапазони (blocked.list) ==="
   if [ ! -f "$BLOCKED" ] || [ ! -s "$BLOCKED" ]; then
-    echo "📋 Список порожній"
+    echo "(порожньо)"
   else
     cat "$BLOCKED" | head -n 100
+  fi
+  echo ""
+  echo "=== Домени (domains.list) ==="
+  if [ ! -f "$DOMAINS" ] || [ ! -s "$DOMAINS" ]; then
+    echo "(порожньо)"
+  else
+    cat "$DOMAINS"
   fi
 }
 
@@ -170,8 +181,56 @@ pbr_add() {
   IP="$1"
   case "$IP" in ''|*[!0-9./]*) echo "❌ Невірний формат"; return 1;; esac
   echo "$IP" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(/([0-9]|[12][0-9]|3[012]))?$' || { echo "❌ Невірний CIDR"; return 1; }
+  grep -qxF "$IP" "$BLOCKED" 2>/dev/null && { echo "ℹ️ Вже є: $IP"; return 0; }
   echo "$IP" >> "$BLOCKED"
   echo "✅ Додано: $IP"
+}
+
+# Резолвить домен і додає всі його IP до blocked.list + домен до domains.list
+pbr_add_domain() {
+  DOMAIN="$1"
+  [ -z "$DOMAIN" ] && { echo "❌ Вкажіть домен, наприклад: warp-api.sh pbr_add_domain vk.com"; return 1; }
+  # Базова перевірка формату
+  echo "$DOMAIN" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(\.[a-zA-Z]{2,})$' || { echo "❌ Невірний домен: $DOMAIN"; return 1; }
+  mkdir -p "$DIR"
+  # Резолвимо через nslookup (є в BusyBox)
+  IPS=$(nslookup "$DOMAIN" 2>/dev/null | awk '/^Address [0-9]+:/{print $3}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+  # Fallback: nslookup без номера (старий BusyBox)
+  [ -z "$IPS" ] && IPS=$(nslookup "$DOMAIN" 2>/dev/null | grep 'Address:' | tail -n +2 | awk '{print $2}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+  if [ -z "$IPS" ]; then
+    echo "❌ Не вдалося резолвити $DOMAIN"
+    return 1
+  fi
+  ADDED=0
+  for IP in $IPS; do
+    grep -qxF "$IP" "$BLOCKED" 2>/dev/null && continue
+    echo "$IP" >> "$BLOCKED"
+    ADDED=$((ADDED+1))
+  done
+  # Зберігаємо домен для наступних pbr_apply
+  grep -qxF "$DOMAIN" "$DOMAINS" 2>/dev/null || echo "$DOMAIN" >> "$DOMAINS"
+  echo "✅ $DOMAIN → додано $ADDED IP ($(echo $IPS | wc -w) всього)"
+  echo "$IPS" | tr ' ' '\n' | sed 's/^/   /'
+  # Якщо PBR активний — одразу додаємо в nft set
+  if nft list set inet fw4 blocked_net >/dev/null 2>&1; then
+    for IP in $IPS; do
+      nft add element inet fw4 blocked_net "{ $IP }" 2>/dev/null
+    done
+    echo "🔄 Додано до активного PBR set"
+  fi
+}
+
+# Видаляє домен зі списку доменів
+pbr_del_domain() {
+  DOMAIN="$1"
+  [ -z "$DOMAIN" ] && { echo "❌ Вкажіть домен"; return 1; }
+  if [ ! -f "$DOMAINS" ] || ! grep -qxF "$DOMAIN" "$DOMAINS" 2>/dev/null; then
+    echo "❌ Домен не знайдено: $DOMAIN"
+    return 1
+  fi
+  grep -vxF "$DOMAIN" "$DOMAINS" > "$DOMAINS.tmp" && mv "$DOMAINS.tmp" "$DOMAINS"
+  echo "✅ Видалено домен: $DOMAIN"
+  echo "ℹ️ IP цього домену залишаються в blocked.list. Оновіть список вручну якщо потрібно."
 }
 
 pbr_del() {
@@ -204,16 +263,37 @@ pbr_update() {
   fi
 }
 
+# Резолвить всі домени з domains.list і додає IP в nft set (без перезапису blocked.list)
+_pbr_resolve_domains() {
+  [ -f "$DOMAINS" ] && [ -s "$DOMAINS" ] || return 0
+  RESOLVED=0
+  while IFS= read -r DOMAIN; do
+    [ -z "$DOMAIN" ] && continue
+    IPS=$(nslookup "$DOMAIN" 2>/dev/null | awk '/^Address [0-9]+:/{print $3}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+    [ -z "$IPS" ] && IPS=$(nslookup "$DOMAIN" 2>/dev/null | grep 'Address:' | tail -n +2 | awk '{print $2}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+    for IP in $IPS; do
+      nft add element inet fw4 blocked_net "{ $IP }" 2>/dev/null
+      RESOLVED=$((RESOLVED+1))
+    done
+  done < "$DOMAINS"
+  [ "$RESOLVED" -gt 0 ] && echo "🌐 Домени: додано $RESOLVED IP з domains.list"
+}
+
 pbr_apply() {
-  if [ ! -s "$BLOCKED" ]; then
-    echo "PBR: blocked.list порожній"
+  if [ ! -s "$BLOCKED" ] && [ ! -s "$DOMAINS" ]; then
+    echo "PBR: blocked.list та domains.list порожні"
     return 1
   fi
   nft add set inet fw4 blocked_net '{ type ipv4_addr; flags interval; }' 2>/dev/null
   nft flush set inet fw4 blocked_net 2>/dev/null
-  while IFS= read -r CIDR; do
-    [ -n "$CIDR" ] && nft add element inet fw4 blocked_net "{ $CIDR }" 2>/dev/null
-  done < "$BLOCKED"
+  # Завантажуємо IP-діапазони
+  if [ -s "$BLOCKED" ]; then
+    while IFS= read -r CIDR; do
+      [ -n "$CIDR" ] && nft add element inet fw4 blocked_net "{ $CIDR }" 2>/dev/null
+    done < "$BLOCKED"
+  fi
+  # Резолвимо домени і додаємо їх IP
+  _pbr_resolve_domains
   OLDH=$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
   [ -n "$OLDH" ] && nft delete rule inet fw4 prerouting handle "$OLDH" 2>/dev/null
   nft insert rule inet fw4 prerouting ip daddr @blocked_net meta mark set 0x1 2>/dev/null
@@ -222,7 +302,7 @@ pbr_apply() {
   ip rule del fwmark 0x1 2>/dev/null
   ip rule add fwmark 0x1 lookup 100
   ip route replace default dev warp table 100 2>/dev/null
-  echo "PBR: застосовано ($(wc -l < "$BLOCKED") записів)"
+  echo "PBR: застосовано ($(wc -l < "$BLOCKED" 2>/dev/null || echo 0) IP-записів)"
 }
 
 pbr_clear() {
@@ -236,7 +316,6 @@ pbr_clear() {
 }
 
 warp_mtu_test() {
-  # Проверяем что warp уже создан
   if ! uci -q get network.warp >/dev/null 2>&1; then
     echo "❌ WARP не налаштовано. Спочатку підключіть: warp-api.sh connect"
     return 1
@@ -244,12 +323,9 @@ warp_mtu_test() {
   echo "⏳ Тест MTU 1420/1400/1380/1280..."
   BEST=""
   for MTU in 1420 1400 1380 1280; do
-    # Встановлюємо MTU через uci та одразу через ip link (подвійна гарантія)
     uci set network.warp.mtu="$MTU"
     uci commit network
-    # Застосовуємо MTU напряму на інтерфейс без повного reload (швидше)
     ip link set mtu "$MTU" dev warp 2>/dev/null || true
-    # Якщо інтерфейс впав — піднімаємо
     ip link show warp 2>/dev/null | grep -q 'DOWN' && ifup warp 2>/dev/null || true
     sleep 6
     HS=$(wg show warp latest-handshakes 2>/dev/null | awk '{print $2}')
@@ -270,9 +346,7 @@ warp_mtu_test() {
 warp_ping() {
   for EP in engage.cloudflareclient.com 162.159.192.1 162.159.193.1 188.114.96.1 188.114.97.1; do
     RESULT=$(ping -c 3 -W 2 "$EP" 2>/dev/null)
-    # BusyBox/OpenWrt format: min/avg/max = X/Y/Z ms
     AVG=$(echo "$RESULT" | grep -oE '[0-9]+/[0-9]+/[0-9]+' | cut -d/ -f2)
-    # Linux fallback: rtt min/avg/max/mdev = X.X/Y.Y/Z.Z/W.W ms
     [ -z "$AVG" ] && AVG=$(echo "$RESULT" | grep -oE '[0-9]+\.[0-9]+/[0-9]+\.[0-9]+/[0-9]+\.[0-9]+' | cut -d/ -f2)
     [ -z "$AVG" ] && AVG="—"
     echo "$EP: ${AVG} ms"
@@ -280,19 +354,21 @@ warp_ping() {
 }
 
 case "$1" in
-  status)     warp_status ;;
-  connect)    warp_connect ;;
-  delete)     warp_delete ;;
-  mode_all)   warp_mode_all ;;
-  mode_stop)  warp_mode_stop ;;
-  mode_pbr)   warp_mode_pbr ;;
-  pbr_list)   pbr_list ;;
-  pbr_add)    pbr_add "$2" ;;
-  pbr_del)    pbr_del "$2" ;;
-  pbr_update) pbr_update ;;
-  pbr_apply)  pbr_apply ;;
-  pbr_clear)  pbr_clear ;;
-  mtu)        warp_mtu_test ;;
-  ping)       warp_ping ;;
-  *) echo "usage: $0 status|connect|delete|mode_all|mode_stop|mode_pbr|pbr_list|pbr_add <IP>|pbr_del <N>|pbr_update|pbr_apply|pbr_clear|mtu|ping" ;;
+  status)          warp_status ;;
+  connect)         warp_connect ;;
+  delete)          warp_delete ;;
+  mode_all)        warp_mode_all ;;
+  mode_stop)       warp_mode_stop ;;
+  mode_pbr)        warp_mode_pbr ;;
+  pbr_list)        pbr_list ;;
+  pbr_add)         pbr_add "$2" ;;
+  pbr_del)         pbr_del "$2" ;;
+  pbr_add_domain)  pbr_add_domain "$2" ;;
+  pbr_del_domain)  pbr_del_domain "$2" ;;
+  pbr_update)      pbr_update ;;
+  pbr_apply)       pbr_apply ;;
+  pbr_clear)       pbr_clear ;;
+  mtu)             warp_mtu_test ;;
+  ping)            warp_ping ;;
+  *) echo "usage: $0 status|connect|delete|mode_all|mode_stop|mode_pbr|pbr_list|pbr_add <IP>|pbr_del <N>|pbr_add_domain <domain>|pbr_del_domain <domain>|pbr_update|pbr_apply|pbr_clear|mtu|ping" ;;
 esac
