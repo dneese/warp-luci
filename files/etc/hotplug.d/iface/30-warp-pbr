@@ -1,0 +1,24 @@
+#!/bin/sh
+# Restore PBR routing rules when warp interface comes up
+# Fixes: after reboot ip route table 100 is empty even if PBR was active
+
+[ "$INTERFACE" = "warp" ] || exit 0
+[ "$ACTION" = "ifup" ] || exit 0
+[ -f /etc/warp/.pbr_active ] || exit 0
+[ -s /etc/warp/blocked.list ] || exit 0
+
+logger -t warp-pbr "warp ifup detected, restoring PBR routes"
+
+# Restore ip rule
+ip rule show | grep -q 'fwmark 0x1' || ip rule add fwmark 0x1 lookup 100
+
+# Restore default route in table 100
+ip route show table 100 | grep -q 'default' || ip route replace default dev warp table 100
+
+# Re-apply nft set if it was flushed (e.g. after firewall restart)
+if ! nft list set inet fw4 blocked_net >/dev/null 2>&1; then
+  logger -t warp-pbr "nft set missing, re-applying full PBR"
+  /usr/bin/warp-api.sh pbr_apply
+fi
+
+logger -t warp-pbr "PBR routes restored"
