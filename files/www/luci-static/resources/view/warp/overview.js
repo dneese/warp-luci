@@ -70,6 +70,15 @@ return view.extend({
     o.load = function() { return fs.trimmed('/etc/warp/blocked.list'); };
     o.write = function(_, val) { return fs.write('/etc/warp/blocked.list', val.trim() + '\n'); };
 
+    o = s.option(form.Button, '_pbr_update');
+    o.title = _('Оновити список');
+    o.inputtitle = _('⬇️ Оновити з інтернету');
+    o.inputstyle = 'button';
+    o.onclick = function() {
+      ui.showModal(_('PBR'), [ E('p', _('Завантажую список...')) ]);
+      return fs.exec('/usr/bin/warp-api.sh', ['pbr_update']).then(function(r){ ui.hideModal(); ui.addNotification(null, E('pre', r.stdout), 'info'); window.location.reload(); });
+    };
+
     o = s.option(form.Button, '_pbr_apply');
     o.title = _('PBR Застосувати');
     o.inputtitle = _('🔄 Застосувати PBR');

@@ -155,6 +155,30 @@ pbr_del() {
   sed -i "${N}d" "$BLOCKED" 2>/dev/null && echo "✅ Видалено" || echo "❌ Немає такого"
 }
 
+pbr_update() {
+  URL="https://raw.githubusercontent.com/dneese/warp-luci/main/blocked.list"
+  mkdir -p "$DIR"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 15 "$URL" -o "$BLOCKED.tmp" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$BLOCKED.tmp" "$URL" 2>/dev/null
+  elif command -v uclient-fetch >/dev/null 2>&1; then
+    uclient-fetch -qO "$BLOCKED.tmp" "$URL" 2>/dev/null
+  else
+    echo "❌ нема curl/wget/uclient-fetch"
+    return 1
+  fi
+  if [ -s "$BLOCKED.tmp" ] && grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.' "$BLOCKED.tmp"; then
+    mv "$BLOCKED.tmp" "$BLOCKED"
+    CNT=$(wc -l < "$BLOCKED" | tr -d ' ')
+    echo "✅ Список оновлено: $CNT записів з $URL"
+  else
+    rm -f "$BLOCKED.tmp"
+    echo "❌ Не вдалося оновити (порожній або битий $URL)"
+    return 1
+  fi
+}
+
 pbr_apply() {
   echo "nft add set inet fw4 warp_block { type ipv4_addr\; flags interval\; }"
   echo "nft flush set inet fw4 warp_block"
@@ -202,9 +226,10 @@ case "$1" in
   pbr_list) pbr_list ;;
   pbr_add) pbr_add "$2" ;;
   pbr_del) pbr_del "$2" ;;
+  pbr_update) pbr_update ;;
   pbr_apply) eval "$(pbr_apply)"; echo "✅ PBR застосовано" ;;
   pbr_clear) eval "$(pbr_clear)"; echo "✅ PBR очищено" ;;
   mtu) warp_mtu_test ;;
   ping) warp_ping ;;
-  *) echo "usage: $0 status|connect|delete|mode_all|mode_stop|pbr_list|pbr_add <IP>|pbr_del <N>|mtu|ping" ;;
+  *) echo "usage: $0 status|connect|delete|mode_all|mode_stop|pbr_list|pbr_add <IP>|pbr_del <N>|pbr_update|pbr_apply|mtu|ping" ;;
 esac
