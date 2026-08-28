@@ -139,6 +139,38 @@ return view.extend({
       });
     };
 
+    // --- Найкращий endpoint (фоновий) ---
+    o = s.option(form.Button, '_best_endpoint');
+    o.title = _('Endpoint');
+    o.inputtitle = _('🌍 Підібрати найшвидший endpoint');
+    o.inputstyle = 'button';
+    o.onclick = function() {
+      ui.showModal(_('Endpoint'), [
+        E('p', _('Пінгую 7 Cloudflare IP у фоні (~20с)...')),
+        E('p', {style:'color:#888'}, _('Оновіть сторінку через 25 секунд — результат з\'явиться у блоці Статус.'))
+      ]);
+      return fs.exec('/usr/bin/warp-api.sh', ['best_endpoint']).then(function(r) {
+        ui.hideModal();
+        ui.addNotification(null, E('pre', r.stdout || r.stderr || '—'), 'info');
+      }).catch(function(e) {
+        ui.hideModal();
+        ui.addNotification(null, E('p', String(e)), 'danger');
+      });
+    };
+
+    // --- Результат endpoint ---
+    o = s.option(form.Button, '_endpoint_result');
+    o.title = _('Результат endpoint');
+    o.inputtitle = _('📋 Показати лог вибору endpoint');
+    o.inputstyle = 'button';
+    o.onclick = function() {
+      return fs.exec('/usr/bin/warp-api.sh', ['endpoint_result']).then(function(r) {
+        ui.addNotification(null, E('pre', r.stdout || r.stderr || '—'), 'info');
+      }).catch(function(e) {
+        ui.addNotification(null, E('p', String(e)), 'danger');
+      });
+    };
+
     // --- Пінг endpoint ---
     o = s.option(form.Button, '_ping');
     o.title = _('Пінг Cloudflare');
