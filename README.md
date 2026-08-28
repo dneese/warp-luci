@@ -20,54 +20,19 @@
 
 ## 🚀 Установка
 
-### ⚡ Способ 1: Одна строка в SSH (САМЫЙ ПРОСТОЙ)
-
-Подключитесь по SSH к роутеру и выполните:
+### ⚡ Одна строка в SSH (САМЫЙ ПРОСТОЙ)
 
 ```bash
-ssh root@192.168.1.1 "curl -fsSL https://raw.githubusercontent.com/dneese/warp-luci/main/install-embedded.sh | sh"
+wget -q -O - https://raw.githubusercontent.com/dneese/warp-luci/main/install-embedded.sh | sh
 ```
 
-Если `curl` не работает, используйте `wget`:
+Или с curl:
 
 ```bash
-ssh root@192.168.1.1 "wget -q -O - https://raw.githubusercontent.com/dneese/warp-luci/main/install-embedded.sh | sh"
+curl -fsSL https://raw.githubusercontent.com/dneese/warp-luci/main/install-embedded.sh | sh
 ```
 
-**Готово! Откройте в браузере:** `http://192.168.1.1/cgi-bin/luci/admin/services/warp`
-
----
-
-### 📋 Способ 2: Через git (если нужны исходники)
-
-На локальной машине:
-
-```bash
-# Скачайте репо
-git clone https://github.com/dneese/warp-luci.git
-cd warp-luci
-
-# Скопируйте на роутер
-scp -r . root@192.168.1.1:/tmp/warp-luci/
-
-# Установите
-ssh root@192.168.1.1 "sh /tmp/warp-luci/install-embedded.sh"
-```
-
----
-
-### 📦 Способ 3: Пакетом через APK (для продвинутых)
-
-```bash
-# На локальной машине постройте пакет
-sh warp-luci/package/build.sh  # → warp-luci_1.0_all.ipk
-
-# Скопируйте пакет
-scp warp-luci/*.ipk root@192.168.1.1:/tmp/
-
-# На роутере установите
-ssh root@192.168.1.1 "apk add --allow-untrusted /tmp/warp-luci_*.ipk"
-```
+**Готово!** Откройте в браузере: `http://192.168.1.1/cgi-bin/luci/admin/services/warp`
 
 ---
 
@@ -87,59 +52,41 @@ http://192.168.1.1/cgi-bin/luci/admin/services/warp
 
 ```bash
 # Статус туннеля
-ssh root@192.168.1.1 "warp-api.sh status"
+warp-api.sh status
 
 # Подключить WARP (авто-регистрация)
-ssh root@192.168.1.1 "warp-api.sh connect"
+warp-api.sh connect
 
 # Весь трафик через WARP
-ssh root@192.168.1.1 "warp-api.sh mode_all"
+warp-api.sh mode_all
 
 # Отключить маршрутизацию (туннель есть, но трафик не идет)
-ssh root@192.168.1.1 "warp-api.sh mode_stop"
+warp-api.sh mode_stop
 
 # Удалить WARP (но оставить приложение)
-ssh root@192.168.1.1 "warp-api.sh delete"
-
-# Список заблокированных IP/CIDR (для PBR)
-ssh root@192.168.1.1 "warp-api.sh pbr_list"
-
-# Добавить IP в список PBR
-ssh root@192.168.1.1 "warp-api.sh pbr_add 87.240.0.0/13"
-
-# Удалить строку из PBR (по номеру)
-ssh root@192.168.1.1 "warp-api.sh pbr_del 1"
-
-# Обновить список с GitHub
-ssh root@192.168.1.1 "warp-api.sh pbr_update"
-
-# Применить PBR (только эти IP через WARP)
-ssh root@192.168.1.1 "warp-api.sh pbr_apply"
-
-# Очистить PBR правила
-ssh root@192.168.1.1 "warp-api.sh pbr_clear"
+warp-api.sh delete
 
 # Тест MTU (автоматический подбор оптимального)
-ssh root@192.168.1.1 "warp-api.sh mtu"
+warp-api.sh mtu
 
 # Пинг endpoint'ов Cloudflare
-ssh root@192.168.1.1 "warp-api.sh ping"
+warp-api.sh ping
 ```
 
 ---
 
 ## 🗑️ Удаление
 
-### ⚡ Одна строка (САМЫЙ ПРОСТОЙ СПОСОБ)
+### ⚡ Одна строка
 
 ```bash
-ssh root@192.168.1.1 "curl -fsSL https://raw.githubusercontent.com/dneese/warp-luci/main/uninstall.sh | sh"
+wget -q -O - https://raw.githubusercontent.com/dneese/warp-luci/main/uninstall.sh | sh
 ```
 
-Или с `wget`:
+Или с curl:
 
 ```bash
-ssh root@192.168.1.1 "wget -q -O - https://raw.githubusercontent.com/dneese/warp-luci/main/uninstall.sh | sh"
+curl -fsSL https://raw.githubusercontent.com/dneese/warp-luci/main/uninstall.sh | sh
 ```
 
 **Удалится:**
@@ -168,7 +115,7 @@ ssh root@192.168.1.1 "wget -q -O - https://raw.githubusercontent.com/dneese/warp
 Проблема с MTU или блокировкой портов. Решение:
 
 ```bash
-ssh root@192.168.1.1 "warp-api.sh mtu"
+warp-api.sh mtu
 ```
 
 Автоматически протестирует MTU 1420 → 1400 → 1380 → 1280.
@@ -177,21 +124,21 @@ ssh root@192.168.1.1 "warp-api.sh mtu"
 
 1. **Проверьте статус:**
 ```bash
-ssh root@192.168.1.1 "warp-api.sh status"
+warp-api.sh status
 ```
 
 2. **Убедитесь, что режим правильный:**
 ```bash
 # Если нужен весь трафик через WARP:
-ssh root@192.168.1.1 "warp-api.sh mode_all"
+warp-api.sh mode_all
 
 # Если нужен только список IP через WARP:
-ssh root@192.168.1.1 "warp-api.sh pbr_update && warp-api.sh pbr_apply"
+warp-api.sh mode_pbr
 ```
 
 3. **Проверьте доступность Cloudflare:**
 ```bash
-ssh root@192.168.1.1 "warp-api.sh ping"
+warp-api.sh ping
 ```
 
 ### Много потерь пакетов
@@ -199,7 +146,7 @@ ssh root@192.168.1.1 "warp-api.sh ping"
 Используйте режим "Весь трафик":
 
 ```bash
-ssh root@192.168.1.1 "warp-api.sh mode_all"
+warp-api.sh mode_all
 ```
 
 ### DNS не работает
@@ -207,7 +154,9 @@ ssh root@192.168.1.1 "warp-api.sh mode_all"
 Используйте публичный DNS (например, 8.8.8.8):
 
 ```bash
-ssh root@192.168.1.1 "uci set network.lan.dns='8.8.8.8 8.8.4.4' && uci commit network && /etc/init.d/network restart"
+uci set network.lan.dns='8.8.8.8 8.8.4.4'
+uci commit network
+/etc/init.d/network restart
 ```
 
 ---
@@ -220,12 +169,9 @@ warp-luci/
 │   ├── usr/bin/warp-api.sh              # Основной бэкенд скрипт
 │   └── www/luci-static/resources/view/warp/
 │       └── overview.js                  # Веб-интерфейс LuCI
-├── install-embedded.sh                  # Однострочная установка
+├── install-embedded.sh                  # Встроенная установка (рекомендуется)
 ├── uninstall.sh                         # Однострочное удаление
 ├── install.sh                           # Классическая установка
-├── package/
-│   ├── Makefile                         # Сборка пакета
-│   └── build.sh                         # Скрипт сборки
 ├── blocked.list                         # Список заблокированных IP (112 записей)
 └── README.md                            # Этот файл
 ```
@@ -235,7 +181,7 @@ warp-luci/
 ## 📊 Размер
 
 - ~13K LuCI веб-интерфейс
-- ~8K бэкенд скрипт
+- ~10K бэкенд скрипт
 - Без дополнительных зависимостей
 
 ---
@@ -256,10 +202,10 @@ MIT
 
 | Действие | Команда |
 |----------|---------|
-| **Установка** | `ssh root@192.168.1.1 "curl -fsSL https://raw.githubusercontent.com/dneese/warp-luci/main/install-embedded.sh \| sh"` |
-| **Удаление** | `ssh root@192.168.1.1 "curl -fsSL https://raw.githubusercontent.com/dneese/warp-luci/main/uninstall.sh \| sh"` |
-| **Статус** | `ssh root@192.168.1.1 "warp-api.sh status"` |
-| **Подключить** | `ssh root@192.168.1.1 "warp-api.sh connect"` |
-| **Весь трафик** | `ssh root@192.168.1.1 "warp-api.sh mode_all"` |
-| **Список IP** | `ssh root@192.168.1.1 "warp-api.sh pbr_list"` |
-| **Тест MTU** | `ssh root@192.168.1.1 "warp-api.sh mtu"` |
+| **Установка** | `wget -q -O - https://raw.githubusercontent.com/dneese/warp-luci/main/install-embedded.sh \| sh` |
+| **Удаление** | `wget -q -O - https://raw.githubusercontent.com/dneese/warp-luci/main/uninstall.sh \| sh` |
+| **Статус** | `warp-api.sh status` |
+| **Подключить** | `warp-api.sh connect` |
+| **Весь трафик** | `warp-api.sh mode_all` |
+| **Тест MTU** | `warp-api.sh mtu` |
+| **Пинг** | `warp-api.sh ping` |
