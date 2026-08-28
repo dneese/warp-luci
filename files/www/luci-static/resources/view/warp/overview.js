@@ -107,22 +107,34 @@ return view.extend({
       });
     };
 
-    // --- MTU тест ---
+    // --- MTU тест (фоновий) ---
     o = s.option(form.Button, '_mtu');
     o.title = _('MTU тест');
     o.inputtitle = _('📏 Підібрати MTU автоматично');
     o.inputstyle = 'button';
     o.onclick = function() {
       ui.showModal(_('MTU тест'), [
-        E('p', _('Тестую MTU 1420/1400/1380/1280... ~30с')),
-        E('p', {}, _('Не закривайте сторінку'))
+        E('p', _('Запускаю тест у фоні (~30с)...')),
+        E('p', {style:'color:#888'}, _('Оновіть сторінку через 35 секунд — результат з\'явиться у блоці Статус.'))
       ]);
       return fs.exec('/usr/bin/warp-api.sh', ['mtu']).then(function(r) {
         ui.hideModal();
         ui.addNotification(null, E('pre', r.stdout || r.stderr || '—'), 'info');
-        window.location.reload();
       }).catch(function(e) {
         ui.hideModal();
+        ui.addNotification(null, E('p', String(e)), 'danger');
+      });
+    };
+
+    // --- Результат MTU ---
+    o = s.option(form.Button, '_mtu_result');
+    o.title = _('Результат MTU');
+    o.inputtitle = _('📋 Показати лог MTU тесту');
+    o.inputstyle = 'button';
+    o.onclick = function() {
+      return fs.exec('/usr/bin/warp-api.sh', ['mtu_result']).then(function(r) {
+        ui.addNotification(null, E('pre', r.stdout || r.stderr || '—'), 'info');
+      }).catch(function(e) {
         ui.addNotification(null, E('p', String(e)), 'danger');
       });
     };

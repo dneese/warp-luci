@@ -2,12 +2,13 @@
 # warp-api.sh — бекенд для LuCI Cloudflare WARP
 # Виклик: warp-api.sh status|connect|delete|mode_all|mode_stop|mode_pbr|
 #   pbr_list|pbr_add <IP>|pbr_del <N>|pbr_add_domain <domain>|pbr_del_domain <domain>|
-#   pbr_update|pbr_apply|pbr_clear|mtu|ping
+#   pbr_update|pbr_apply|pbr_clear|mtu|mtu_result|ping
 
 DIR="/etc/warp"
 WARP_REG="$DIR/warp.reg"
 BLOCKED="$DIR/blocked.list"
 DOMAINS="$DIR/domains.list"
+MTU_LOG="$DIR/mtu.log"
 
 warp_status() {
   if ! uci -q get network.warp >/dev/null 2>&1; then
@@ -32,6 +33,11 @@ warp_status() {
     esac
   fi
   ip addr show warp 2>/dev/null | grep -q "inet" && echo "warp: up" || echo "warp: down"
+  # Показуємо результат MTU тесту якщо є
+  if [ -f "$MTU_LOG" ]; then
+    echo "--- MTU лог ---"
+    cat "$MTU_LOG"
+  fi
 }
 
 warp_connect() {
@@ -107,7 +113,7 @@ warp_delete() {
     i=$((i-1))
   done
   uci commit network; uci commit firewall
-  rm -f "$WARP_REG" "$DIR/.pbr_active"
+  rm -f "$WARP_REG" "$DIR/.pbr_active" "$MTU_LOG"
   /etc/init.d/network reload 2>/dev/null
   echo "🗑 WARP видалено"
 }
@@ -185,7 +191,6 @@ pbr_add() {
   echo "✅ Додано: $IP"
 }
 
-# Резолвить домен і додає всі його IP до blocked.list + домен до domains.list
 pbr_add_domain() {
   DOMAIN="$1"
   [ -z "$DOMAIN" ] && { echo "❌ Вкажіть домен, наприклад: warp-api.sh pbr_add_domain vk.com"; return 1; }
@@ -214,7 +219,6 @@ pbr_add_domain() {
   fi
 }
 
-# Видаляє домен зі списку доменів
 pbr_del_domain() {
   DOMAIN="$1"
   [ -z "$DOMAIN" ] && { echo "❌ Вкажіть домен"; return 1; }
@@ -257,7 +261,6 @@ pbr_update() {
   fi
 }
 
-# Резолвить всі домени з domains.list і додає IP в nft set (без перезапису blocked.list)
 _pbr_resolve_domains() {
   [ -f "$DOMAINS" ] && [ -s "$DOMAINS" ] || return 0
   RESOLVED=0
@@ -294,7 +297,6 @@ pbr_apply() {
   ip rule del fwmark 0x1 2>/dev/null
   ip rule add fwmark 0x1 lookup 100
   ip route replace default dev warp table 100 2>/dev/null
-  # Зберігаємо флаг щоб hotplug відновив PBR після перезавантаження
   touch "$DIR/.pbr_active"
   echo "PBR: застосовано ($(wc -l < "$BLOCKED" 2>/dev/null || echo 0) IP-записів)"
 }
@@ -310,32 +312,57 @@ pbr_clear() {
   echo "PBR: правила прибрано"
 }
 
-warp_mtu_test() {
-  if ! uci -q get network.warp >/dev/null 2>&1; then
-    echo "❌ WARP не налаштовано. Спочатку підключіть: warp-api.sh connect"
-    return 1
-  fi
-  echo "⏳ Тест MTU 1420/1400/1380/1280..."
+# Внутрішній: власне тест MTU, пишемо в лог-файл (викликається у фоні)
+_mtu_run() {
+  mkdir -p "$DIR"
+  echo "⏳ Запущено: $(date)" > "$MTU_LOG"
   BEST=""
   for MTU in 1420 1400 1380 1280; do
     uci set network.warp.mtu="$MTU"
     uci commit network
     ip link set mtu "$MTU" dev warp 2>/dev/null || true
     ip link show warp 2>/dev/null | grep -q 'DOWN' && ifup warp 2>/dev/null || true
-    sleep 6
+    sleep 5
     HS=$(wg show warp latest-handshakes 2>/dev/null | awk '{print $2}')
     if [ -n "$HS" ] && [ "$HS" != "0" ]; then
-      echo "✅ MTU $MTU: handshake OK"
+      echo "✅ MTU $MTU: handshake OK" >> "$MTU_LOG"
       [ -z "$BEST" ] && BEST="$MTU"
     else
-      echo "❌ MTU $MTU: no handshake"
+      echo "❌ MTU $MTU: no handshake" >> "$MTU_LOG"
     fi
   done
   FINAL="${BEST:-1280}"
   uci set network.warp.mtu="$FINAL"
   uci commit network
   ip link set mtu "$FINAL" dev warp 2>/dev/null || true
-  echo "📏 Фінальний MTU: $FINAL"
+  echo "📏 Фінальний MTU: $FINAL" >> "$MTU_LOG"
+  echo "✅ Готово: $(date)" >> "$MTU_LOG"
+}
+
+warp_mtu_test() {
+  if ! uci -q get network.warp >/dev/null 2>&1; then
+    echo "❌ WARP не налаштовано. Спочатку підключіть: warp-api.sh connect"
+    return 1
+  fi
+  # Перевіряємо чи тест вже запущений
+  if [ -f "$MTU_LOG" ] && grep -q '⏳ Запущено' "$MTU_LOG" && ! grep -q '✅ Готово' "$MTU_LOG"; then
+    echo "⏳ Тест MTU вже виконується, зачекайте ~30с"
+    echo "Поточний лог:"
+    cat "$MTU_LOG"
+    return 0
+  fi
+  # Запускаємо у фоні — LuCI не чекає
+  ( _mtu_run ) &
+  echo "⏳ MTU тест запущено у фоні (~30с)"
+  echo "Оновіть статус через 30 секунд — результат з'явиться в блоці Статус."
+}
+
+warp_mtu_result() {
+  if [ ! -f "$MTU_LOG" ]; then
+    echo "(лог MTU тесту відсутній — запустіть: warp-api.sh mtu)"
+    return
+  fi
+  cat "$MTU_LOG"
 }
 
 warp_ping() {
@@ -364,6 +391,7 @@ case "$1" in
   pbr_apply)       pbr_apply ;;
   pbr_clear)       pbr_clear ;;
   mtu)             warp_mtu_test ;;
+  mtu_result)      warp_mtu_result ;;
   ping)            warp_ping ;;
-  *) echo "usage: $0 status|connect|delete|mode_all|mode_stop|mode_pbr|pbr_list|pbr_add <IP>|pbr_del <N>|pbr_add_domain <domain>|pbr_del_domain <domain>|pbr_update|pbr_apply|pbr_clear|mtu|ping" ;;
+  *) echo "usage: $0 status|connect|delete|mode_all|mode_stop|mode_pbr|pbr_list|pbr_add <IP>|pbr_del <N>|pbr_add_domain <domain>|pbr_del_domain <domain>|pbr_update|pbr_apply|pbr_clear|mtu|mtu_result|ping" ;;
 esac
