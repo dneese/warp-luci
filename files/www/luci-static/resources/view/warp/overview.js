@@ -12,7 +12,7 @@ return view.extend({
   },
   render: function(status) {
     var m, s, o;
-    m = new form.Map('warp', _('Cloudflare WARP'), _('Легка настройка Cloudflare WARP: статус, підключити, видалити, весь трафік, список, пінг, MTU.'));
+    m = new form.Map('warp', _('Cloudflare WARP'), _(''));
 
     s = m.section(form.NamedSection, 'config', 'warp', _('WARP керування'));
     s.addremove = false;
@@ -67,29 +67,14 @@ return view.extend({
     o = s.option(form.TextValue, 'blocked', _('Список (по одному CIDR/IP на рядок)'), _('Напр. 93.184.216.34 або 5.188.86.0/24. Застосувати — кнопка нижче.'));
     o.optional = true;
     o.rows = 6;
-    o.load = function() { return fs.trimmed('/etc/tg-bot/blocked.list'); };
-    o.write = function(_, val) { return fs.write('/etc/tg-bot/blocked.list', val.trim() + '\n'); };
+    o.load = function() { return fs.trimmed('/etc/warp/blocked.list'); };
+    o.write = function(_, val) { return fs.write('/etc/warp/blocked.list', val.trim() + '\n'); };
 
     o = s.option(form.Button, '_pbr_apply');
     o.title = _('PBR Застосувати');
     o.inputtitle = _('🔄 Застосувати PBR');
     o.inputstyle = 'apply';
     o.onclick = function() { return fs.exec('/usr/bin/warp-api.sh', ['pbr_apply']).then(function(r){ ui.addNotification(null, E('pre', r.stdout), 'info'); }); };
-
-    o = s.option(form.Button, '_mtu');
-    o.title = _('MTU тест');
-    o.inputtitle = _('📏 MTU-тест (1420/1400/1380/1280)');
-    o.inputstyle = 'button';
-    o.onclick = function() {
-      ui.showModal(_('MTU'), [ E('p', _('Тестую ~1.5 хв, інтернет мигатиме...')) ]);
-      return fs.exec('/usr/bin/warp-api.sh', ['mtu']).then(function(r){ ui.hideModal(); ui.addNotification(null, E('pre', r.stdout), 'info'); });
-    };
-
-    o = s.option(form.Button, '_ping');
-    o.title = _('Пінг');
-    o.inputtitle = _('📡 Пінг endpoint');
-    o.inputstyle = 'button';
-    o.onclick = function() { return fs.exec('/usr/bin/warp-api.sh', ['ping']).then(function(r){ ui.addNotification(null, E('pre', r.stdout), 'info'); }); };
 
     return m.render();
   }

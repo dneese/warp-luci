@@ -1,9 +1,8 @@
 #!/bin/sh
-# warp-api.sh — бэкенд для LuCI WARP-страницы (без бота)
+# warp-api.sh — бэкенд для LuCI Cloudflare WARP
 # Вызов: warp-api.sh status|connect|delete|mode_all|mode_stop|pbr_list|pbr_add <IP>|pbr_del <N>|mtu|ping
-# Всё как в tg-router-bot: warp_reg_script, pbr, mtu, ping
 
-DIR="/etc/tg-bot"
+DIR="/etc/warp"
 WARP_REG="$DIR/warp.reg"
 BLOCKED="$DIR/blocked.list"
 
@@ -29,11 +28,11 @@ warp_status() {
 }
 
 warp_connect() {
-  # авто-регистрация как в tg-router-bot warp_reg_script (упрощено)
+  # авто-регистрация через Cloudflare API
   command -v wg >/dev/null 2>&1 || { apk add wireguard-tools 2>/dev/null || opkg install wireguard-tools 2>/dev/null; }
   PRIV=$(wg genkey 2>/dev/null)
   PUB=$(echo "$PRIV" | wg pubkey 2>/dev/null)
-  # Cloudflare API (как в боте)
+  # Cloudflare API
   JSON=$(curl -s --max-time 10 -X POST https://api.cloudflareclient.com/v0a2158/reg -H "Content-Type: application/json" -d "{\"install_id\":\"\",\"tos\":\"$(date -u +%FT%T.000Z)\",\"key\":\"$PUB\",\"fcm_token\":\"\",\"type\":\"\",\"locale\":\"en-US\"}" 2>/dev/null)
   ID=$(echo "$JSON" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
   TOKEN=$(echo "$JSON" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)

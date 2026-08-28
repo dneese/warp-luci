@@ -8,7 +8,7 @@
 
 - 📊 **Статус** — тунель активен / handshake / режим (весь трафик / PBR / idle), `warp: up/down`
 - ⚡️ **Подключить** — авто-регистрация через публичный API Cloudflare (`wireguard-tools`, ключи остаются на роутере, без перехвата трафика)
-- 🗑 **Удалить WARP** — интерфейс `warp`, peer `wireguard_warp`, зона `warp`, ключи `/etc/tg-bot/warp.reg`
+- 🗑 **Удалить WARP** — интерфейс `warp`, peer `wireguard_warp`, зона `warp`, ключи `/etc/warp/warp.reg`
 - 🟢 **Весь трафик** — `route_allowed_ips=1` + `firewall forwarding lan→warp`, ⏸ **Остановить** — `route_allowed_ips=0`
 - 📋 **PBR Список** — ручной список заблокированных IP/CIDR (112 записей) → `nftables set + fwmark 0x1` → только они через WARP
 - 📏 **MTU-тест** — перебор 1420/1400/1380/1280 с проверкой handshake, авто-возврат на 1280

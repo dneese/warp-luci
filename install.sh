@@ -4,7 +4,7 @@
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DIR="/www/luci-static/resources/view/warp"
 echo "== WARP Service installer =="
-mkdir -p /usr/bin /etc/tg-bot /www/luci-static/resources/view/warp /usr/share/luci/menu.d /usr/share/rpcd/acl.d
+mkdir -p /usr/bin /etc/warp /www/luci-static/resources/view/warp /usr/share/luci/menu.d /usr/share/rpcd/acl.d
 cp "$SRC/files/usr/bin/warp-api.sh" /usr/bin/warp-api.sh && chmod +x /usr/bin/warp-api.sh
 cp "$SRC/files/www/luci-static/resources/view/warp/overview.js" /www/luci-static/resources/view/warp/overview.js
 chmod 644 /www/luci-static/resources/view/warp/overview.js 2>/dev/null
@@ -21,7 +21,7 @@ cat > /usr/share/luci/menu.d/luci-app-warp.json <<'EOF'
   }
 }
 EOF
-touch /etc/config/warp 2>/dev/null
+uci set warp.config=config 2>/dev/null || uci set warp.config='config' 2>/dev/null; uci commit warp 2>/dev/null
 rm -f /tmp/luci-* 2>/dev/null
 mkdir -p /usr/share/rpcd/acl.d
 cat > /usr/share/rpcd/acl.d/luci-app-warp.json <<'EOF'
@@ -29,7 +29,7 @@ cat > /usr/share/rpcd/acl.d/luci-app-warp.json <<'EOF'
   "luci-app-warp": {
     "description": "WARP Service",
     "read": { "uci": ["warp"], "file": { "/usr/bin/warp-api.sh": ["exec"] } },
-    "write": { "uci": ["warp"], "file": { "/etc/tg-bot/blocked.list": ["read","write"] } }
+    "write": { "uci": ["warp"], "file": { "/etc/warp/blocked.list": ["read","write"] } }
   }
 }
 EOF
