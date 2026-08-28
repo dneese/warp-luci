@@ -17,13 +17,18 @@ warp_status() {
   else
     echo "🟢 Тунель активний (hs=$HS)"
   fi
-  # режим
-  ALLOWED=$(uci -q get network.@wireguard_warp[0].route_allowed_ips 2>/dev/null)
-  case "$ALLOWED" in
-    "1"|"0.0.0.0/0"*) echo "режим: весь трафік через WARP" ;;
-    "0") echo "режим: тунель є, трафік не перехоплюється" ;;
-    *) echo "режим: PBR ($ALLOWED)" ;;
-  esac
+  # режим: проверяем PBR по nft set, иначе по route_allowed_ips
+  if nft list set inet fw4 blocked_net >/dev/null 2>&1; then
+    CNT=$(nft list set inet fw4 blocked_net 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l | tr -d ' ')
+    echo "режим: тільки заблоковані через WARP (PBR, ${CNT:-0} записів)"
+  else
+    ALLOWED=$(uci -q get network.@wireguard_warp[0].route_allowed_ips 2>/dev/null)
+    case "$ALLOWED" in
+      "1"|"0.0.0.0/0"*) echo "режим: весь трафік через WARP" ;;
+      "0") echo "режим: тунель є, трафік не перехоплюється" ;;
+      *) echo "режим: PBR ($ALLOWED)" ;;
+    esac
+  fi
   ip addr show warp 2>/dev/null | grep -q "inet" && echo "warp: up" || echo "warp: down"
 }
 
@@ -180,19 +185,38 @@ pbr_update() {
 }
 
 pbr_apply() {
-  echo "nft add set inet fw4 warp_block { type ipv4_addr\; flags interval\; }"
-  echo "nft flush set inet fw4 warp_block"
-  while IFS= read -r CIDR; do
-    [ -z "$CIDR" ] && continue
-    echo "nft add element inet fw4 warp_block { $CIDR }"
-  done < "$BLOCKED"
-  echo "nft add rule inet fw4 forward ip daddr @warp_block counter mark set 0x1"
-  echo "ip rule add fwmark 0x1 table 100"
-  echo "ip route add default dev warp table 100 2>/dev/null"
+  cat <<PEOF
+BFILE="$BLOCKED"
+if [ ! -s "\$BFILE" ]; then echo "PBR: blocked.list порожній"; exit 1; fi
+nft add set inet fw4 blocked_net '{ type ipv4_addr; flags interval; }' 2>/dev/null
+nft flush set inet fw4 blocked_net 2>/dev/null
+while IFS= read -r CIDR; do
+  [ -n "\$CIDR" ] && nft add element inet fw4 blocked_net "{ \$CIDR }" 2>/dev/null
+done < "\$BFILE"
+# iptables fallback + nft prerouting (правильне місце — prerouting, не forward)
+OLDH=\$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
+[ -n "\$OLDH" ] && nft delete rule inet fw4 prerouting handle \$OLDH 2>/dev/null
+nft insert rule inet fw4 prerouting ip daddr @blocked_net meta mark set 0x1 2>/dev/null
+# iptables mangle для сумісності
+iptables -t mangle -D PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
+iptables -t mangle -A PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
+ip rule del fwmark 0x1 2>/dev/null
+ip rule add fwmark 0x1 lookup 100
+ip route replace default dev warp table 100 2>/dev/null
+echo "PBR: застосовано (\$(wc -l < "\$BFILE") записів)"
+PEOF
 }
 
 pbr_clear() {
-  echo "nft flush set inet fw4 warp_block 2>/dev/null; nft delete set inet fw4 warp_block 2>/dev/null; ip rule del fwmark 0x1 table 100 2>/dev/null; ip route del default dev warp table 100 2>/dev/null"
+  cat <<CEOF
+nft flush set inet fw4 blocked_net 2>/dev/null
+nft delete set inet fw4 blocked_net 2>/dev/null
+OLDH=\$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
+[ -n "\$OLDH" ] && nft delete rule inet fw4 prerouting handle \$OLDH 2>/dev/null
+iptables -t mangle -D PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
+ip rule del fwmark 0x1 2>/dev/null
+echo "PBR: правила прибрано"
+CEOF
 }
 
 warp_mtu_test() {
