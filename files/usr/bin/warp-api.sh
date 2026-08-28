@@ -157,7 +157,6 @@ warp_mode_pbr() {
   /etc/init.d/network reload 2>/dev/null
   sleep 2
   pbr_apply
-  touch "$DIR/.pbr_active"
   echo "📋 Режим PBR активовано"
 }
 
@@ -190,12 +189,9 @@ pbr_add() {
 pbr_add_domain() {
   DOMAIN="$1"
   [ -z "$DOMAIN" ] && { echo "❌ Вкажіть домен, наприклад: warp-api.sh pbr_add_domain vk.com"; return 1; }
-  # Базова перевірка формату
   echo "$DOMAIN" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(\.[a-zA-Z]{2,})$' || { echo "❌ Невірний домен: $DOMAIN"; return 1; }
   mkdir -p "$DIR"
-  # Резолвимо через nslookup (є в BusyBox)
   IPS=$(nslookup "$DOMAIN" 2>/dev/null | awk '/^Address [0-9]+:/{print $3}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
-  # Fallback: nslookup без номера (старий BusyBox)
   [ -z "$IPS" ] && IPS=$(nslookup "$DOMAIN" 2>/dev/null | grep 'Address:' | tail -n +2 | awk '{print $2}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
   if [ -z "$IPS" ]; then
     echo "❌ Не вдалося резолвити $DOMAIN"
@@ -207,11 +203,9 @@ pbr_add_domain() {
     echo "$IP" >> "$BLOCKED"
     ADDED=$((ADDED+1))
   done
-  # Зберігаємо домен для наступних pbr_apply
   grep -qxF "$DOMAIN" "$DOMAINS" 2>/dev/null || echo "$DOMAIN" >> "$DOMAINS"
   echo "✅ $DOMAIN → додано $ADDED IP ($(echo $IPS | wc -w) всього)"
   echo "$IPS" | tr ' ' '\n' | sed 's/^/   /'
-  # Якщо PBR активний — одразу додаємо в nft set
   if nft list set inet fw4 blocked_net >/dev/null 2>&1; then
     for IP in $IPS; do
       nft add element inet fw4 blocked_net "{ $IP }" 2>/dev/null
@@ -286,13 +280,11 @@ pbr_apply() {
   fi
   nft add set inet fw4 blocked_net '{ type ipv4_addr; flags interval; }' 2>/dev/null
   nft flush set inet fw4 blocked_net 2>/dev/null
-  # Завантажуємо IP-діапазони
   if [ -s "$BLOCKED" ]; then
     while IFS= read -r CIDR; do
       [ -n "$CIDR" ] && nft add element inet fw4 blocked_net "{ $CIDR }" 2>/dev/null
     done < "$BLOCKED"
   fi
-  # Резолвимо домени і додаємо їх IP
   _pbr_resolve_domains
   OLDH=$(nft -a list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
   [ -n "$OLDH" ] && nft delete rule inet fw4 prerouting handle "$OLDH" 2>/dev/null
@@ -302,6 +294,8 @@ pbr_apply() {
   ip rule del fwmark 0x1 2>/dev/null
   ip rule add fwmark 0x1 lookup 100
   ip route replace default dev warp table 100 2>/dev/null
+  # Зберігаємо флаг щоб hotplug відновив PBR після перезавантаження
+  touch "$DIR/.pbr_active"
   echo "PBR: застосовано ($(wc -l < "$BLOCKED" 2>/dev/null || echo 0) IP-записів)"
 }
 
@@ -312,6 +306,7 @@ pbr_clear() {
   [ -n "$OLDH" ] && nft delete rule inet fw4 prerouting handle "$OLDH" 2>/dev/null
   iptables -t mangle -D PREROUTING -m set --match-set blocked_net dst -j MARK --set-mark 0x1 2>/dev/null
   ip rule del fwmark 0x1 2>/dev/null
+  rm -f "$DIR/.pbr_active"
   echo "PBR: правила прибрано"
 }
 
