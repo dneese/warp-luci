@@ -1,24 +1,48 @@
 #!/bin/sh
-# Restore PBR routing rules when warp interface comes up
-# Fixes: after reboot ip route table 100 is empty even if PBR was active
+# Restore PBR after reboot: waits for firewall, checks nft prerouting rule,
+# re-applies full PBR if anything is missing.
 
 [ "$INTERFACE" = "warp" ] || exit 0
-[ "$ACTION" = "ifup" ] || exit 0
+[ "$ACTION" = "ifup" ]    || exit 0
 [ -f /etc/warp/.pbr_active ] || exit 0
 [ -s /etc/warp/blocked.list ] || [ -s /etc/warp/domains.list ] || exit 0
 
-logger -t warp-pbr "warp ifup detected, restoring PBR routes"
+logger -t warp-pbr "warp ifup: checking PBR state..."
 
-# Restore ip rule
-ip rule show | grep -q 'fwmark 0x1' || ip rule add fwmark 0x1 lookup 100
+# Чекаємо поки fw4 повністю піднявся (макс 10 секунд)
+I=0
+while [ $I -lt 10 ]; do
+  nft list ruleset >/dev/null 2>&1 && break
+  sleep 1
+  I=$((I+1))
+done
+# Додаткова пауза щоб fw4 додав свої chain і ruleс
+sleep 2
 
-# Restore default route in table 100
-ip route show table 100 | grep -q 'default' || ip route replace default dev warp table 100
+NEED_FULL=0
 
-# Re-apply nft set if it was flushed (e.g. after firewall restart)
-if ! nft list set inet fw4 blocked_net >/dev/null 2>&1; then
-  logger -t warp-pbr "nft set missing, re-applying full PBR"
+# 1. Перевіряємо наявність nft set
+nft list set inet fw4 blocked_net >/dev/null 2>&1 || NEED_FULL=1
+
+# 2. Перевіряємо наявність правила маркування в prerouting
+[ $NEED_FULL -eq 0 ] && {
+  nft list chain inet fw4 prerouting 2>/dev/null | grep -q 'blocked_net' || NEED_FULL=1
+}
+
+# 3. Перевіряємо ip rule
+[ $NEED_FULL -eq 0 ] && {
+  ip rule show | grep -q 'fwmark 0x1' || NEED_FULL=1
+}
+
+# 4. Перевіряємо маршрут в table 100
+[ $NEED_FULL -eq 0 ] && {
+  ip route show table 100 2>/dev/null | grep -q 'default' || NEED_FULL=1
+}
+
+if [ $NEED_FULL -eq 1 ]; then
+  logger -t warp-pbr "PBR rules missing — running full pbr_apply"
   /usr/bin/warp-api.sh pbr_apply
+  logger -t warp-pbr "pbr_apply done"
+else
+  logger -t warp-pbr "PBR already active, nothing to do"
 fi
-
-logger -t warp-pbr "PBR routes restored"
