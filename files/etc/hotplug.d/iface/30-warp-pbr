@@ -1,48 +1,64 @@
 #!/bin/sh
-# Restore PBR after reboot: waits for firewall, checks nft prerouting rule,
-# re-applies full PBR if anything is missing.
+# Restore WARP routing after reboot / interface flap.
+# Reads /etc/warp/.mode ("all" | "pbr") and re-applies via warp-api.sh.
 
 [ "$INTERFACE" = "warp" ] || exit 0
 [ "$ACTION" = "ifup" ]    || exit 0
-[ -f /etc/warp/.pbr_active ] || exit 0
-[ -s /etc/warp/blocked.list ] || [ -s /etc/warp/domains.list ] || exit 0
+[ -f /etc/warp/.mode ]    || exit 0
 
-logger -t warp-pbr "warp ifup: checking PBR state..."
+# Захист від рекурсії: warp-api.sh сам робить ifup warp, і hotplug-скрипт
+# не повинен перезаписувати режим під час перемикання.
+# Busybox на роутері не має stat — час lock'а беремо з його вмісту.
+if [ -f /etc/warp/.lock ]; then
+  MT=$(cat /etc/warp/.lock 2>/dev/null | tr -cd '0-9')
+  NOW=$(date +%s)
+  if [ -n "$MT" ] && [ "$MT" -gt 0 ] 2>/dev/null && [ $((NOW - MT)) -lt 120 ]; then
+    exit 0
+  fi
+  # порожній/битий lock — вважаємо мертвим лише якщо пройшло >= 120с
+  if [ -z "$MT" ]; then
+    exit 0
+  fi
+  rm -f /etc/warp/.lock
+fi
 
-# Чекаємо поки fw4 повністю піднявся (макс 10 секунд)
+MODE=$(cat /etc/warp/.mode 2>/dev/null)
+[ -n "$MODE" ] || exit 0
+
+logger -t warp "warp ifup: restoring mode=$MODE"
+
+# Wait for firewall/nft to be ready (max 15s)
 I=0
-while [ $I -lt 10 ]; do
+while [ $I -lt 15 ]; do
   nft list ruleset >/dev/null 2>&1 && break
   sleep 1
   I=$((I+1))
 done
-# Додаткова пауза щоб fw4 додав свої chain і ruleс
-sleep 2
+sleep 3
 
-NEED_FULL=0
+case "$MODE" in
+  all) /usr/bin/warp-api.sh mode_all  >/dev/null 2>&1 ;;
+  pbr) /usr/bin/warp-api.sh mode_pbr  >/dev/null 2>&1 ;;
+  *)   exit 0 ;;
+esac
 
-# 1. Перевіряємо наявність nft set
-nft list set inet fw4 blocked_net >/dev/null 2>&1 || NEED_FULL=1
-
-# 2. Перевіряємо наявність правила маркування в prerouting
-[ $NEED_FULL -eq 0 ] && {
-  nft list chain inet fw4 prerouting 2>/dev/null | grep -q 'blocked_net' || NEED_FULL=1
-}
-
-# 3. Перевіряємо ip rule
-[ $NEED_FULL -eq 0 ] && {
-  ip rule show | grep -q 'fwmark 0x1' || NEED_FULL=1
-}
-
-# 4. Перевіряємо маршрут в table 100
-[ $NEED_FULL -eq 0 ] && {
-  ip route show table 100 2>/dev/null | grep -q 'default' || NEED_FULL=1
-}
-
-if [ $NEED_FULL -eq 1 ]; then
-  logger -t warp-pbr "PBR rules missing — running full pbr_apply"
-  /usr/bin/warp-api.sh pbr_apply
-  logger -t warp-pbr "pbr_apply done"
-else
-  logger -t warp-pbr "PBR already active, nothing to do"
+# firewall reload після hotplug стирає nft set/правила PBR.
+# Чекаємо доки firewall не зміниться і правила не відновляться.
+if [ "$MODE" = "pbr" ]; then
+  J=0
+  while [ $J -lt 8 ]; do
+    nft list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | grep -q 'meta mark set' && {
+      # правило на місці — перевіряємо ще раз через 2с, чи firewall не знесе його пізніше
+      sleep 2
+      nft list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | grep -q 'meta mark set' && break
+    }
+    J=$((J+1))
+    sleep 2
+  done
+  nft list chain inet fw4 prerouting 2>/dev/null | grep 'blocked_net' | grep -q 'meta mark set' || {
+    /usr/bin/warp-api.sh pbr_apply >/dev/null 2>&1
+    logger -t warp "warp ifup: nft rules wiped by firewall reload — re-applied"
+  }
 fi
+
+logger -t warp "warp ifup: restore done"
