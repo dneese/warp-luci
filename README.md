@@ -94,6 +94,7 @@ curl -fsSL https://raw.githubusercontent.com/dneese/warp-luci/main/uninstall.sh 
 **Удалится:**
 - ✅ Веб-интерфейс LuCI
 - ✅ Скрипт `warp-api.sh`
+- ✅ Hotplug-скрипт автовосстановления
 - ✅ Туннель Cloudflare WARP (если был создан)
 - ✅ Все конфиги и ключи
 - ✅ Firewall правила
@@ -204,14 +205,24 @@ uci commit network
 warp-luci/
 ├── files/
 │   ├── usr/bin/warp-api.sh              # Основной бэкенд скрипт
+│   ├── etc/hotplug.d/iface/
+│   │   └── 30-warp-pbr                  # Восстановление режима после ребута
 │   └── www/luci-static/resources/view/warp/
 │       └── overview.js                  # Веб-интерфейс LuCI
-├── install-embedded.sh                  # Встроенная установка (рекомендуется)
+├── install-embedded.sh                  # Установка (рекомендуется)
+├── install.sh                           # Установка (то же самое, другой вход)
 ├── uninstall.sh                         # Однострочное удаление
-├── install.sh                           # Классическая установка
-├── blocked.list                         # Список заблокированных IP (список в blocked.list)
+├── blocked.list                         # Список заблокированных IP
 └── README.md                            # Этот файл
 ```
+
+> `install.sh` и `install-embedded.sh` делают одно и то же — оба скачивают
+> `warp-api.sh` и hotplug-скрипт из репозитория. Раньше `install.sh` встраивал
+> свою копию скрипта, из-за чего она разошлась с `files/` и получила те же баги,
+> что и режим «весь трафик». Сейчас единственный источник правды — каталог `files/`.
+
+> Установщик **не перезаписывает** `/etc/warp/.mode`, поэтому активный режим
+> (весь трафик или список) переживает переустановку.
 
 ---
 

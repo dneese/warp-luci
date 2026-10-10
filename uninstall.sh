@@ -48,6 +48,7 @@ uci commit warp 2>/dev/null || true
 # Удаляем файлы приложения
 echo "📂 Удаляю файлы..."
 rm -f /usr/bin/warp-api.sh 2>/dev/null || true
+rm -f /etc/hotplug.d/iface/30-warp-pbr 2>/dev/null || true
 rm -rf /www/luci-static/resources/view/warp 2>/dev/null || true
 rm -f /usr/share/luci/menu.d/luci-app-warp.json 2>/dev/null || true
 rm -f /usr/share/rpcd/acl.d/luci-app-warp.json 2>/dev/null || true
