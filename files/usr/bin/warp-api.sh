@@ -472,7 +472,7 @@ pbr_add_domain() {
   echo "$IPS" | tr ' ' '\n' | sed 's/^/   /'
   if nft list set inet fw4 blocked_net >/dev/null 2>&1; then
     for IP in $IPS; do
-      nft add element inet fw4 blocked_net "{ $IP }" 2>/dev/null
+      nft add element inet fw4 blocked_net "{ $IP/32 }" 2>/dev/null
     done
     echo "🔄 Додано до активного PBR set"
   fi
@@ -511,6 +511,15 @@ pbr_update() {
   fi
   if [ -s "$BLOCKED.tmp" ] && grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.' "$BLOCKED.tmp"; then
     mv "$BLOCKED.tmp" "$BLOCKED"
+    # одразу нормалізуємо файл: без дублів, битих масок та IPv6
+    mkdir -p "$DIR"
+    if _pbr_normalize "$BLOCKED" > "$DIR/.blocked.norm" 2> "$DIR/.blocked.norm.err"; then
+      mv "$DIR/.blocked.norm" "$BLOCKED"
+      cat "$DIR/.blocked.norm.err" 2>/dev/null
+      rm -f "$DIR/.blocked.norm.err"
+    else
+      rm -f "$DIR/.blocked.norm" "$DIR/.blocked.norm.err"
+    fi
     CNT=$(wc -l < "$BLOCKED" | tr -d ' ')
     echo "✅ Список оновлено: $CNT записів"
   else
@@ -528,11 +537,86 @@ _pbr_resolve_domains() {
     IPS=$(nslookup "$DOMAIN" 2>/dev/null | awk '/^Address [0-9]+:/{print $3}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
     [ -z "$IPS" ] && IPS=$(nslookup "$DOMAIN" 2>/dev/null | grep 'Address:' | tail -n +2 | awk '{print $2}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
     for IP in $IPS; do
-      nft add element inet fw4 blocked_net "{ $IP }" 2>/dev/null
+      nft add element inet fw4 blocked_net "{ $IP/32 }" 2>/dev/null
       RESOLVED=$((RESOLVED+1))
     done
   done < "$DOMAINS"
   [ "$RESOLVED" -gt 0 ] && echo "🌐 Домени: додано $RESOLVED IP з domains.list"
+}
+
+# Нормалізує список діапазонів перед заливкою в nft:
+#   • прибирає IPv6 (set створено як ipv4_addr — IPv6 туди не приймається)
+#   • прибирає невалідні рядки
+#   • виправляє маску (прибирає host-біти: 213.79.65.32/19 → 213.79.64.0/19)
+#   • прибирає дублікати та діапазони, вже вкриті ширшим
+# Без цього nft відхиляє перетинні/дубльовані елементи interval-set
+# (помилка -ENOTEMPTY) і вони гучно-тихо випадають із блокліста.
+# Результат — у stdout, статистика — у stderr.
+_pbr_normalize() {
+  awk '
+    {
+      line = $0
+      sub(/#.*/, "", line)
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line == "") next
+      total++
+      if (line ~ /:/) { v6++; next }
+      n = split(line, p, "/")
+      ip = p[1]
+      plen = (n > 1 ? p[2] : 32)
+      if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { bad++; next }
+      if (split(ip, o, ".") != 4) { bad++; next }
+      for (i = 1; i <= 4; i++) {
+        if (o[i] !~ /^[0-9]+$/) { bad++; next }
+        if (o[i] + 0 > 255) { bad++; next }
+      }
+      if (plen !~ /^[0-9]+$/ || plen + 0 > 32) { bad++; next }
+      plen += 0
+      v = 0
+      for (i = 1; i <= 4; i++) v = v * 256 + o[i] + 0
+      sz = 2 ^ (32 - plen)
+      net = v - (v % sz)
+      key = net "/" plen
+      if (seen[key]++) { dup++; next }
+      u++
+      st[u] = net
+      en[u] = net + sz - 1
+      pl[u] = plen
+    }
+    END {
+      for (i = 1; i <= u; i++) {
+        cov = 0
+        for (j = 1; j <= u; j++) {
+          if (i == j) continue
+          if (st[j] <= st[i] && en[j] >= en[i]) { cov = 1; break }
+        }
+        if (cov) { subc++; continue }
+        s = int(st[i] / 16777216) % 256 "." int(st[i] / 65536) % 256 "." int(st[i] / 256) % 256 "." st[i] % 256
+        print s "/" pl[i]
+        kept++
+      }
+      printf("ℹ️ список: %d рядків → %d діапазонів (дублі: %d, вкриті ширшим: %d, IPv6: %d, невалідні: %d)\n", total, kept, dup, subc, v6, bad) > "/dev/stderr"
+    }
+  ' "$1"
+}
+
+# Заливає нормалізований список у nft-set.
+# Результат: APPLIED — скільки прийнято, FAILED — скільки відхилено nft.
+_pbr_fill_set() {
+  mkdir -p "$DIR"
+  NORM="$DIR/.blocked.norm"
+  _pbr_normalize "$BLOCKED" > "$NORM" 2> "$DIR/.blocked.norm.err"
+  APPLIED=0
+  FAILED=0
+  while IFS= read -r CIDR; do
+    [ -n "$CIDR" ] || continue
+    if nft add element inet fw4 blocked_net "{ $CIDR }" 2>/dev/null; then
+      APPLIED=$((APPLIED+1))
+    else
+      FAILED=$((FAILED+1))
+      echo "⚠️ nft відхилив: $CIDR" >> "$DIR/.blocked.norm.err"
+    fi
+  done < "$NORM"
 }
 
 pbr_apply() {
@@ -542,11 +626,8 @@ pbr_apply() {
   fi
   nft add set inet fw4 blocked_net '{ type ipv4_addr; flags interval; }' 2>/dev/null
   nft flush set inet fw4 blocked_net 2>/dev/null
-  if [ -s "$BLOCKED" ]; then
-    while IFS= read -r CIDR; do
-      [ -n "$CIDR" ] && nft add element inet fw4 blocked_net "{ $CIDR }" 2>/dev/null
-    done < "$BLOCKED"
-  fi
+  _pbr_fill_set
+  cat "$DIR/.blocked.norm.err" 2>/dev/null
   _pbr_resolve_domains
 
   # маршрутизація через policy routing (НЕ route_allowed_ips)
@@ -560,8 +641,9 @@ pbr_apply() {
   _pbr_nft_rules
 
   touch "$DIR/.pbr_active"
-  CNT=$(wc -l < "$BLOCKED" 2>/dev/null || echo 0)
-  echo "PBR: застосовано ($CNT IP-записів)"
+  CNT="$APPLIED"
+  echo "PBR: застосовано $CNT записів"
+  [ "${FAILED:-0}" -gt 0 ] && echo "⚠️ nft відхилив $FAILED записів"
 
   # Перевірка: set + обидва правила мають бути на місці
   nft list set inet fw4 blocked_net >/dev/null 2>&1 || { echo "⚠️ nft set не створено"; return 1; }
@@ -587,9 +669,7 @@ _pbr_resync() {
   _pbr_nft_verify || {
     nft add set inet fw4 blocked_net '{ type ipv4_addr; flags interval; }' 2>/dev/null
     nft flush set inet fw4 blocked_net 2>/dev/null
-    [ -s "$BLOCKED" ] && while IFS= read -r CIDR; do
-      [ -n "$CIDR" ] && nft add element inet fw4 blocked_net "{ $CIDR }" 2>/dev/null
-    done < "$BLOCKED"
+    _pbr_fill_set
     _pbr_resolve_domains >/dev/null 2>&1
     _pbr_nft_rules
     sleep 1
@@ -626,28 +706,36 @@ pbr_clear() {
 
 _mtu_run() {
   mkdir -p "$DIR"
+  # lock — щоб hotplug не відновлював режим посеред тесту
+  date +%s > "$LOCK"
   echo "⏳ Запущено: $(date)" > "$MTU_LOG"
   BEST=""
   for MTU in 1420 1400 1380 1280; do
     uci set network.warp.mtu="$MTU"
     uci commit network
-    ip link set mtu "$MTU" dev warp 2>/dev/null || true
-    ip link show warp 2>/dev/null | grep -q 'DOWN' && ifup warp 2>/dev/null || true
-    sleep 5
+    # Перезапускаємо інтерфейс: старий handshake у wg не доводить,
+    # що новий MTU працює — потрібен саме НОВИЙ handshake після зміни.
+    ifdown warp 2>/dev/null
+    sleep 1
+    T0=$(date +%s)
+    ifup warp 2>/dev/null
+    sleep 6
     HS=$(wg show warp latest-handshakes 2>/dev/null | awk '{print $2}')
-    if [ -n "$HS" ] && [ "$HS" != "0" ]; then
-      echo "✅ MTU $MTU: handshake OK" >> "$MTU_LOG"
+    if [ -n "$HS" ] && [ "$HS" != "0" ] && [ "$HS" -ge "$T0" ]; then
+      echo "✅ MTU $MTU: новий handshake OK" >> "$MTU_LOG"
       [ -z "$BEST" ] && BEST="$MTU"
     else
-      echo "❌ MTU $MTU: no handshake" >> "$MTU_LOG"
+      echo "❌ MTU $MTU: нового handshake немає" >> "$MTU_LOG"
     fi
   done
   FINAL="${BEST:-1280}"
   uci set network.warp.mtu="$FINAL"
   uci commit network
   ip link set mtu "$FINAL" dev warp 2>/dev/null || true
+  ip link show warp >/dev/null 2>&1 || ifup warp 2>/dev/null
   echo "📏 Фінальний MTU: $FINAL" >> "$MTU_LOG"
   echo "✅ Готово: $(date)" >> "$MTU_LOG"
+  rm -f "$LOCK"
 }
 
 warp_mtu_test() {

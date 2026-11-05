@@ -92,10 +92,17 @@ echo "⚙️  Инициализирую конфиг..."
 uci set warp.config=config 2>/dev/null || true
 uci commit warp 2>/dev/null || true
 
-# Активный режим хранится здесь и восстанавливается hotplug-скриптом
+# Активный режим хранится здесь и восстанавливается hotplug-скриптом.
+# Значение должно быть одним из режимов, которые понимает warp-api.sh
+# ("all" | "pbr") — иначе hotplug не сможет восстановить режим после ребута.
 if [ ! -f /etc/warp/.mode ]; then
-  echo "list" > /etc/warp/.mode
+  echo "pbr" > /etc/warp/.mode
 fi
+
+# LuCI выполняет warp-api.sh через rpcd, у которого по умолчанию timeout 30 с.
+# "ping" (~50 с) и "connect" (~25 с) в этом лимите обрываются на середине.
+uci set rpcd.@rpcd[0].timeout='120' 2>/dev/null || true
+uci commit rpcd 2>/dev/null || true
 
 echo "🔄 Перезагружаю сервисы..."
 /etc/init.d/rpcd restart 2>/dev/null || true
