@@ -566,7 +566,7 @@ pbr_update() {
   URL="https://raw.githubusercontent.com/dneese/warp-luci/main/blocked.list"
   mkdir -p "$DIR"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --max-time 15 "$URL" -o "$BLOCKED.tmp" 2>/dev/null
+    curl -fsSL --connect-timeout 5 --max-time 15 "$URL" -o "$BLOCKED.tmp" 2>/dev/null
   elif command -v wget >/dev/null 2>&1; then
     wget -q -O "$BLOCKED.tmp" "$URL" 2>/dev/null
   elif command -v uclient-fetch >/dev/null 2>&1; then
@@ -798,6 +798,16 @@ pbr_clear() {
 
 # ─────────────────────────── MTU / endpoint / ping ───────────────────────────
 
+# Відновити активний режим після операцій, які рухають інтерфейс warp
+# (ifdown/ifup → firewall reload → nft-правила PBR зникають).
+_restore_active_mode() {
+  MODE=$(cat "$MODE_FILE" 2>/dev/null)
+  case "$MODE" in
+    all) /usr/bin/warp-api.sh mode_all  >/dev/null 2>&1 ;;
+    pbr) /usr/bin/warp-api.sh mode_pbr  >/dev/null 2>&1 ;;
+  esac
+}
+
 _mtu_run() {
   mkdir -p "$DIR"
   # lock — щоб hotplug не відновлював режим посеред тесту
@@ -830,6 +840,9 @@ _mtu_run() {
   echo "📏 Фінальний MTU: $FINAL" >> "$MTU_LOG"
   echo "✅ Готово: $(date)" >> "$MTU_LOG"
   rm -f "$LOCK"
+  # Тест перезапускав інтерфейс → firewall reload зніс правила PBR,
+  # а hotplug їх не відновив (тримав lock). Без цього PBR лишається мертвим.
+  _restore_active_mode
 }
 
 warp_mtu_test() {
@@ -842,7 +855,11 @@ warp_mtu_test() {
     cat "$MTU_LOG"
     return 0
   fi
-  ( _mtu_run ) &
+  # ВАЖЛИВО: stdout/stderr фонового процесу треба відрізати.
+  # Інакше він тримає відкритим stdout-трубу rpcd → RPC-відповідь не
+  # повертається до завершення (~30 с) → браузер обриває запит
+  # ("XHR request aborted by browser"). Лог пишеться у $MTU_LOG.
+  ( _mtu_run ) >/dev/null 2>&1 &
   echo "⏳ MTU тест запущено у фоні (~30с)"
 }
 
@@ -907,7 +924,8 @@ _endpoint_run() {
     ifdown warp 2>/dev/null; sleep 1; ifup warp 2>/dev/null
   fi
   # перезастосувати активний режим із новим endpoint
-  [ -f "$MODE_FILE" ] && { M=$(cat "$MODE_FILE"); routes_apply "$M" >/dev/null 2>&1; }
+  # ( firewall reload після ifup зніс nft-правила PBR — потрібен повний mode_pbr )
+  _restore_active_mode
   echo "✅ Готово: $(date)" >> "$ENDPOINT_LOG"
 }
 
@@ -916,12 +934,21 @@ warp_best_endpoint() {
     echo "❌ WARP не налаштовано. Спочатку: warp-api.sh connect"
     return 1
   fi
+  if [ -f "$LOCK" ]; then
+    MT=$(cat "$LOCK" 2>/dev/null | tr -cd '0-9')
+    NOW=$(date +%s)
+    if [ -n "$MT" ] && [ "$MT" -gt 0 ] 2>/dev/null && [ $((NOW - MT)) -lt 120 ]; then
+      echo "⏳ Зараз виконується інша операція (MTU-тест) — зачекайте ~30с"
+      return 0
+    fi
+  fi
   if [ -f "$ENDPOINT_LOG" ] && grep -q '⏳ Запущено' "$ENDPOINT_LOG" && ! grep -q '✅ Готово' "$ENDPOINT_LOG"; then
     echo "⏳ Вибір endpoint вже виконується, зачекайте ~20с"
     cat "$ENDPOINT_LOG"
     return 0
   fi
-  ( _endpoint_run ) &
+  # stdout фону відрізаємо — інакше RPC-відповідь зависає до кінця тесту
+  ( _endpoint_run ) >/dev/null 2>&1 &
   echo "⏳ Пошук найшвидшого endpoint запущено у фоні (~20с)"
 }
 

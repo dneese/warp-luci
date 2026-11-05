@@ -98,7 +98,7 @@ return view.extend({
         window.location.reload();
       }).catch(function(e) {
         if (spinnerEl) spinnerEl.style.display = 'none';
-        ui.addNotification(null, E('p', String(e)), 'danger');
+        ui.addNotification(null, E('p', friendlyError(e)), 'danger');
       });
     }
 
@@ -124,7 +124,7 @@ return view.extend({
           window.location.reload();
         }).catch(function(e) {
           if (sp) sp.style.display = 'none';
-          ui.addNotification(null, E('p', String(e)), 'danger');
+          ui.addNotification(null, E('p', friendlyError(e)), 'danger');
         });
       }));
     } else if (state === 'no_handshake') {
@@ -205,7 +205,7 @@ return view.extend({
         var out = (r.stdout || r.stderr || '').trim();
         ui.addNotification(null, E('pre', { style:'font-size:13px' }, out || 'Застосовано'), 'info');
       }).catch(function(e) {
-        ui.addNotification(null, E('p', String(e)), 'danger');
+        ui.addNotification(null, E('p', friendlyError(e)), 'danger');
       });
     });
     listBtns.appendChild(saveBtn);
@@ -220,13 +220,13 @@ return view.extend({
       fs.exec('/usr/bin/warp-api.sh', ['pbr_update']).then(function(r) {
         updBtn.disabled = false;
         updBtn.textContent = '⬇️ Оновити з GitHub';
-        var out = (r.stdout || r.stderr || '').trim();
-        ui.addNotification(null, E('pre', { style:'font-size:13px' }, out), 'info');
+        var out = ((r.stdout || '') + (r.stderr || '')).trim();
+        ui.addNotification(null, E('pre', { style:'font-size:13px' }, out || 'Список оновлено'), r.code === 0 ? 'info' : 'danger');
         fs.trimmed('/etc/warp/blocked.list').then(function(val) { textarea.value = val || ''; });
       }).catch(function(e) {
         updBtn.disabled = false;
         updBtn.textContent = '⬇️ Оновити з GitHub';
-        ui.addNotification(null, E('p', String(e)), 'danger');
+        ui.addNotification(null, E('p', friendlyError(e)), 'danger');
       });
     });
     listBtns.appendChild(updBtn);
@@ -243,6 +243,26 @@ return view.extend({
 
     var advBody = E('div', { style: 'padding:14px 4px 4px;display:flex;flex-direction:column;gap:10px' });
 
+    // helper: людське повідомлення замість сирого "XHR request aborted by browser"
+    function friendlyError(e) {
+      var msg = String((e && e.message) ? e.message : e);
+      if (/aborted|timed out|timeout/i.test(msg))
+        return '⚠️ Команда не встигла завершитися. Перевірте лог нижче або повторіть.';
+      return '⚠️ ' + msg;
+    }
+
+    // Автополінг логу фонової операції (mtu / endpoint), поки не з'явиться "✅ Готово"
+    function pollLog(path, el, tries) {
+      tries = tries || 0;
+      if (tries > 45) return;
+      fs.read(path).then(function(txt) {
+        el.textContent = (txt || '').trim();
+        el.style.display = 'block';
+        if (!/✅ Готово/.test(txt || ''))
+          window.setTimeout(function() { pollLog(path, el, tries + 1); }, 2000);
+      }).catch(function() {});
+    }
+
     function advBtn(label, args, dangerous) {
       var btn = E('button', {
         style: [
@@ -258,13 +278,15 @@ return view.extend({
         fs.exec('/usr/bin/warp-api.sh', args).then(function(r) {
           btn.disabled = false;
           btn.textContent = origText;
-          var out = (r.stdout || r.stderr || '').trim();
+          var out = ((r.stdout || '') + (r.stderr || '')).trim();
           if (out) { resultEl.textContent = out; resultEl.style.display = 'block'; }
-          if (args[0] === 'delete' || args[0] === 'connect') window.location.reload();
+          if (args[0] === 'delete' || args[0] === 'connect') { window.location.reload(); return; }
+          if (args[0] === 'mtu') pollLog('/etc/warp/mtu.log', resultEl);
+          if (args[0] === 'best_endpoint') pollLog('/etc/warp/endpoint.log', resultEl);
         }).catch(function(e) {
           btn.disabled = false;
           btn.textContent = origText;
-          resultEl.textContent = String(e);
+          resultEl.textContent = friendlyError(e);
           resultEl.style.display = 'block';
         });
       });
