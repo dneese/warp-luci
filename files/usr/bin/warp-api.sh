@@ -234,11 +234,22 @@ warp_status() {
 
   # коротка перевірка реальної маршрутизації
   if [ "$M" != "none" ]; then
-    R=$(ip route get 1.1.1.1 2>/dev/null | head -1)
-    case "$R" in
-      *"dev warp"*) echo "маршрут 1.1.1.1: через warp ✓" ;;
-      *) echo "маршрут 1.1.1.1: НЕ через warp ✗ ($R)" ;;
-    esac
+    if [ "$M" = "pbr" ]; then
+      # У PBR 1.1.1.1 НЕ маркується — перевіряємо перший IP зі списку
+      TGT=$(grep -m1 -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$BLOCKED" 2>/dev/null)
+      [ -n "$TGT" ] || TGT=1.1.1.1
+      R=$(ip route get "$TGT" mark 1 2>/dev/null | head -1)
+      case "$R" in
+        *"dev warp"*) echo "маршрут $TGT: через warp ✓" ;;
+        *) echo "маршрут $TGT: НЕ через warp ✗ ($R)" ;;
+      esac
+    else
+      R=$(ip route get 1.1.1.1 2>/dev/null | head -1)
+      case "$R" in
+        *"dev warp"*) echo "маршрут 1.1.1.1: через warp ✓" ;;
+        *) echo "маршрут 1.1.1.1: НЕ через warp ✗ ($R)" ;;
+      esac
+    fi
   fi
 
   if [ -f "$MTU_LOG" ]; then
@@ -342,6 +353,7 @@ warp_delete() {
   done
   uci commit network; uci commit firewall
   rm -f "$WARP_REG" "$DIR/.pbr_active" "$MTU_LOG" "$ENDPOINT_LOG"
+  _dns_restore
   /etc/init.d/network reload 2>/dev/null
   /etc/init.d/firewall restart 2>/dev/null
   echo "🗑 WARP видалено"
@@ -401,7 +413,60 @@ warp_mode_stop() {
   del_pref "$RULE_EP"
   ip route flush table $TBL 2>/dev/null
   rm -f "$MODE_FILE" "$DIR/.pbr_active" "$LOCK"
+  _dns_restore
   echo "⏸ Трафік не перехоплюється (тунель є)"
+}
+
+# ─────────────── DNS для заблокованих доменів ───────────────
+# Локальні/українські DNS віддають для заблокованих сайтів локальні CDN-IP
+# (напр. vk.com → 78.111.217.9), яких немає в blocked.list. Такі адреси не
+# маркуються fwmark → ідуть напряму → провайдер їх блокує.
+# Публічні DNS (1.1.1.1/8.8.8.8) віддають справжні IP (vk.com → 87.240.x),
+# які в blocked.list → маркуються → ідуть через WARP.
+
+DNS_PUB="1.1.1.1 8.8.8.8"
+
+_dns_save() {
+  mkdir -p "$DIR"
+  uci -q get dhcp.@dnsmasq[0].server   > "$DIR/.dns_saved.server"   2>/dev/null || : > "$DIR/.dns_saved.server"
+  uci -q get dhcp.@dnsmasq[0].noresolv > "$DIR/.dns_saved.noresolv" 2>/dev/null || : > "$DIR/.dns_saved.noresolv"
+}
+
+_dns_is_public() {
+  [ "$(uci -q get dhcp.@dnsmasq[0].noresolv 2>/dev/null)" = "1" ] || return 1
+  case " $(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null) " in
+    *" 1.1.1.1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+_dns_enable() {
+  _dns_is_public && return 0
+  _dns_save
+  uci -q delete dhcp.@dnsmasq[0].server
+  for S in $DNS_PUB; do uci add_list dhcp.@dnsmasq[0].server="$S"; done
+  uci set dhcp.@dnsmasq[0].noresolv="1"
+  uci commit dhcp
+  /etc/init.d/dnsmasq reload >/dev/null 2>&1 || /etc/init.d/dnsmasq restart >/dev/null 2>&1
+  echo "🌍 DNS переведено на публічні резолвери ($DNS_PUB)"
+}
+
+_dns_restore() {
+  [ -f "$DIR/.dns_saved.server" ] || return 0
+  uci -q delete dhcp.@dnsmasq[0].server
+  for S in $(cat "$DIR/.dns_saved.server" 2>/dev/null); do
+    uci add_list dhcp.@dnsmasq[0].server="$S"
+  done
+  NOR=$(cat "$DIR/.dns_saved.noresolv" 2>/dev/null)
+  if [ -n "$NOR" ]; then
+    uci set dhcp.@dnsmasq[0].noresolv="$NOR"
+  else
+    uci -q delete dhcp.@dnsmasq[0].noresolv
+  fi
+  uci commit dhcp
+  /etc/init.d/dnsmasq reload >/dev/null 2>&1 || /etc/init.d/dnsmasq restart >/dev/null 2>&1
+  rm -f "$DIR/.dns_saved.server" "$DIR/.dns_saved.noresolv"
+  echo "🌍 DNS повернуто до попередніх налаштувань"
 }
 
 warp_mode_pbr() {
@@ -412,15 +477,16 @@ warp_mode_pbr() {
   peer_set route_allowed_ips '0'
   uci commit network
   ip link show warp >/dev/null 2>&1 || ifup warp 2>/dev/null
-  sleep 3
+  sleep 1
   # fw_apply робить firewall reload — він зтирає nft set та правила.
-  # Тому спершу застосовуємо PBR, а після reload обов'язково resync-имо.
+  # Тому спершу робимо firewall, а ПОТІМ pbr_apply: він останнім кроком
+  # знову заливає set і ставить правила. Без цього порядку список
+  # заливався двічі (~8 зайвих секунд) — LuCI встигав упасти з таймаутом.
+  fw_apply || { rm -f "$LOCK"; return 1; }
+  sleep 1
   pbr_apply
   RC=$?
-  fw_apply || { rm -f "$LOCK"; return 1; }
-  sleep 2
-  # firewall reload міг знести nft-правила — відновлюємо
-  _pbr_resync && echo "✅ PBR відновлено після firewall reload"
+  _dns_enable
   rm -f "$LOCK"
   return $RC
 }
@@ -600,23 +666,51 @@ _pbr_normalize() {
   ' "$1"
 }
 
+# Додає в nft-set батч елементів (список через кому).
+# Якщо батч відхилено — додаємо по одному, щоб рахувати відхилені.
+_pbr_add_chunk() {
+  if nft add element inet fw4 blocked_net "{ $1 }" 2>/dev/null; then
+    APPLIED=$((APPLIED + $2))
+    return 0
+  fi
+  for C in $(echo "$1" | tr ',' ' '); do
+    if nft add element inet fw4 blocked_net "{ $C }" 2>/dev/null; then
+      APPLIED=$((APPLIED+1))
+    else
+      FAILED=$((FAILED+1))
+      echo "⚠️ nft відхилив: $C" >> "$DIR/.blocked.norm.err"
+    fi
+  done
+}
+
 # Заливає нормалізований список у nft-set.
 # Результат: APPLIED — скільки прийнято, FAILED — скільки відхилено nft.
+# Елементи йдуть БАТЧЕМ (по 64 у виклику): 142 елементи ≈ 0.1 с
+# замість ≈3 с при 142 окремих викликах nft.
 _pbr_fill_set() {
   mkdir -p "$DIR"
   NORM="$DIR/.blocked.norm"
   _pbr_normalize "$BLOCKED" > "$NORM" 2> "$DIR/.blocked.norm.err"
   APPLIED=0
   FAILED=0
+  CHUNK=""
+  CN=0
   while IFS= read -r CIDR; do
     [ -n "$CIDR" ] || continue
-    if nft add element inet fw4 blocked_net "{ $CIDR }" 2>/dev/null; then
-      APPLIED=$((APPLIED+1))
+    if [ -z "$CHUNK" ]; then
+      CHUNK="$CIDR"
+      CN=1
     else
-      FAILED=$((FAILED+1))
-      echo "⚠️ nft відхилив: $CIDR" >> "$DIR/.blocked.norm.err"
+      CHUNK="$CHUNK, $CIDR"
+      CN=$((CN+1))
+    fi
+    if [ "$CN" -ge 64 ]; then
+      _pbr_add_chunk "$CHUNK" "$CN"
+      CHUNK=""
+      CN=0
     fi
   done < "$NORM"
+  [ -n "$CHUNK" ] && _pbr_add_chunk "$CHUNK" "$CN"
 }
 
 pbr_apply() {

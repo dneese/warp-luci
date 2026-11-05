@@ -15,10 +15,8 @@ if [ -f /etc/warp/.lock ]; then
   if [ -n "$MT" ] && [ "$MT" -gt 0 ] 2>/dev/null && [ $((NOW - MT)) -lt 120 ]; then
     exit 0
   fi
-  # порожній/битий lock — вважаємо мертвим лише якщо пройшло >= 120с
-  if [ -z "$MT" ]; then
-    exit 0
-  fi
+  # порожній або застарілий lock — вважаємо мертвим.
+  # Раніше тут був exit 0: порожній .lock назавжди вимикав відновлення PBR.
   rm -f /etc/warp/.lock
 fi
 
@@ -34,7 +32,7 @@ while [ $I -lt 15 ]; do
   sleep 1
   I=$((I+1))
 done
-sleep 3
+sleep 1
 
 case "$MODE" in
   all) /usr/bin/warp-api.sh mode_all  >/dev/null 2>&1 ;;

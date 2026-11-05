@@ -3,6 +3,15 @@
 'require fs';
 'require ui';
 
+// LuCI за замовчуванням обриває RPC-запит через 20 с. Операції WARP
+// (connect ~10 с, mode_pbr, підбір endpoint/MTU) встигають вище.
+// Піднімаємо таймаут саме для цієї сторінки.
+try {
+  if (typeof L !== 'undefined' && L.env) {
+    L.env.rpctimeout = L.env.rpctimeout || 60;
+  }
+} catch (e) {}
+
 // Визначаємо поточний стан за stdout warp-api.sh status
 function parseState(status) {
   if (/не налаштовано/i.test(status))      return 'disconnected';
@@ -83,8 +92,9 @@ return view.extend({
       if (spinnerEl) spinnerEl.style.display = 'block';
       return fs.exec('/usr/bin/warp-api.sh', args).then(function(r) {
         if (spinnerEl) spinnerEl.style.display = 'none';
-        var out = (r.stdout || r.stderr || '').trim();
-        if (out) ui.addNotification(null, E('pre', { style:'white-space:pre-wrap;font-size:13px' }, out), 'info');
+        var out = ((r.stdout || '') + (r.stderr || '')).trim();
+        if (out) ui.addNotification(null, E('pre', { style:'white-space:pre-wrap;font-size:13px' }, out), r.code === 0 ? 'info' : 'danger');
+        if (r.code !== 0) return;
         window.location.reload();
       }).catch(function(e) {
         if (spinnerEl) spinnerEl.style.display = 'none';
@@ -100,10 +110,15 @@ return view.extend({
         var info = document.getElementById('warp-action-info');
         if (info) info.textContent = 'Реєстрація у Cloudflare... (~10с)';
         fs.exec('/usr/bin/warp-api.sh', ['connect']).then(function(r) {
-          var out = (r.stdout || r.stderr || '').trim();
+          var out = ((r.stdout || '') + (r.stderr || '')).trim();
+          if (r.code !== 0) throw new Error(out || 'Підключення не вдалося');
           if (info) info.textContent = 'Підключено! Активую маршрутизацію...';
           // Одразу вмикаємо PBR
-          return fs.exec('/usr/bin/warp-api.sh', ['mode_pbr']);
+          return fs.exec('/usr/bin/warp-api.sh', ['mode_pbr']).then(function(r2) {
+            var out2 = ((r2.stdout || '') + (r2.stderr || '')).trim();
+            if (r2.code !== 0) throw new Error(out2 || 'Не вдалося увімкнути режим PBR');
+            if (out2) ui.addNotification(null, E('pre', { style:'white-space:pre-wrap;font-size:13px' }, out2), 'info');
+          });
         }).then(function() {
           if (sp) sp.style.display = 'none';
           window.location.reload();
